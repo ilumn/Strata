@@ -21,8 +21,8 @@ constexpr int kProbes = 3;       // a lookup window size is tried this often bef
 
 }  // namespace
 
-DraftPolicy::DraftPolicy(int max_t, double margin)
-    : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin) {}
+DraftPolicy::DraftPolicy(int max_t, double margin, CostMode costs)
+    : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin), costs_(costs) {}
 
 int DraftPolicy::bucket(int match) {
     return match < 6 ? 0 : match < 12 ? 1 : match < 24 ? 2 : 3;
@@ -35,6 +35,7 @@ double DraftPolicy::lookup_rate(int match) const {
 
 double DraftPolicy::cost_ms(int t) const {
     t = std::clamp(t, 1, kMaxT);
+    if (costs_ == CostMode::FixedShape) return kShape[t];
     if (cost_n_[t] > 0) return cost_[t];
     // scale from the measured sizes, weighting each by how often it was seen
     double num = 0.0, den = 0.0;
@@ -83,7 +84,11 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
 
 void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double round_ms) {
     t = std::clamp(t, 1, kMaxT);
-    if (round_ms > 0) {
+    if (costs_ == CostMode::FixedShape) {
+        // Counts also bound exploratory probes. They must advance even though
+        // elapsed time is deliberately excluded from the decision state.
+        cost_n_[t] += 1.0;
+    } else if (round_ms > 0) {
         cost_[t] = cost_n_[t] > 0 ? (1.0 - kCostAlpha) * cost_[t] + kCostAlpha * round_ms : round_ms;
         cost_n_[t] += 1.0;
     }

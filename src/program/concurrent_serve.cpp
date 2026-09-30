@@ -246,6 +246,11 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
     const bool profiling = std::getenv("STRATA_CONCURRENT_PROFILE") != nullptr;
     const char* draft_batch_env = std::getenv("STRATA_BATCH_DRAFT");
     const bool parallel_drafts = draft_batch_env && std::atoi(draft_batch_env) != 0;
+    const char* policy_env = std::getenv("STRATA_DETERMINISTIC_DRAFT_POLICY");
+    const auto policy_costs = policy_env && std::atoi(policy_env) != 0
+        ? spec::DraftPolicy::CostMode::FixedShape : spec::DraftPolicy::CostMode::Measured;
+    std::fprintf(stderr, "strata concurrent: draft policy costs=%s overlap=%d\n",
+                 policy_costs == spec::DraftPolicy::CostMode::FixedShape ? "fixed-shape" : "measured", parallel_drafts);
     const bool trace_rounds = std::getenv("STRATA_CONCURRENT_TRACE") != nullptr;
     double target_ms = 0, draft_ms = 0, commit_ms = 0, adapt_ms = 0, prefill_ms = 0;
     int64_t produced = 0, target_rows = 0;
@@ -417,7 +422,7 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
             s.current = (int32_t) s.request.tokens.back();
             s.consumed.clear();
             std::fill(std::begin(s.probability), std::end(s.probability), 0.0f);
-            s.suffix.reset(); s.policy = spec::DraftPolicy{c.window};
+            s.suffix.reset(); s.policy = spec::DraftPolicy{c.window, 0.03, policy_costs};
             for (auto token : s.request.tokens) s.suffix.append((int32_t) token);
             core::session_zero(*s.state, g, nullptr, m.prompt_stream);
             if (cudaStreamSynchronize(m.prompt_stream) != cudaSuccess) { err = "concurrency: reset failed"; return 1; }

@@ -12,7 +12,9 @@
 //
 // and takes the lookup window only when its best E/cost beats the MTP's by `margin`. Costs are the measured round
 // times per window size (EMA; sizes not seen yet are scaled from seen ones by a prior shape), so the policy adapts
-// to the machine and the context length. It only chooses which drafts to verify: the output is unchanged.
+// to the machine and the context length. Different windows can change mixed CPU/GPU expert routing and cache
+// adaptation, so mathematical speculative-decoding equivalence does not guarantee bitwise output equivalence.
+// FixedShape keeps acceptance learning but uses the prior relative costs, independent of wall-clock timing.
 #pragma once
 
 #include <array>
@@ -24,7 +26,8 @@ public:
     static constexpr int kMaxT = 8;
     static constexpr int kBuckets = 4;
 
-    explicit DraftPolicy(int max_t, double margin = 0.03);
+    enum class CostMode { Measured, FixedShape };
+    explicit DraftPolicy(int max_t, double margin = 0.03, CostMode costs = CostMode::Measured);
 
     struct Pick {
         bool lookup = false;
@@ -36,7 +39,7 @@ public:
     void observe(bool lookup, int t, int accepted, int match, double round_ms);
 
     double lookup_rate(int match) const;   // current q for a match length
-    double cost_ms(int t) const;           // measured or scaled round time of a window of t tokens
+    double cost_ms(int t) const;           // measured/scaled ms, or relative cost units in FixedShape mode
 
 private:
     static int bucket(int match);
@@ -44,6 +47,7 @@ private:
 
     int max_t_;
     double margin_;
+    CostMode costs_;
     std::array<double, kMaxT + 1> cost_{}, cost_n_{};      // round ms by window size
     std::array<double, kMaxT + 1> mtp_tok_{}, mtp_n_{};    // tokens committed by MTP windows of that size
     std::array<double, kBuckets> ok_{}, bad_{};            // lookup drafts accepted / windows cut short, decayed

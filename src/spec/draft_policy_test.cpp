@@ -58,6 +58,38 @@ int main() {
         for (int i = 0; i < 3; ++i) p.observe(true, 6, 5, 40, 3.0 * cost(6));   // it turns out very expensive
         check(!p.choose(4, 5, 40).lookup, "after the probes, the measured cost decides");
     }
+    {
+        DraftPolicy slow(8, 0.03, DraftPolicy::CostMode::FixedShape);
+        DraftPolicy fast(8, 0.03, DraftPolicy::CostMode::FixedShape);
+        bool same = true, used_lookup = false, used_mtp = false;
+        // Identical observed tokens with timing spikes, order-dependent serial
+        // costs and invalid/unavailable timing. Future choices must stay equal.
+        for (int i = 0; i < 4000; ++i) {
+            const int t = 2 + i % 7, accepted = (i / 7) % t;
+            const bool lookup = i % 3 != 0;
+            const int match = 4 + i % 40;
+            slow.observe(lookup, t, accepted, match, i % 9 ? 500.0 * t : -1.0);
+            fast.observe(lookup, t, accepted, match, i % 11 ? 0.01 * (9 - t) : 0.0);
+            for (int n = 2; n <= 8; ++n) {
+                const auto a = slow.choose(n, 7, match), b = fast.choose(n, 7, match);
+                same = same && a.lookup == b.lookup && a.t == b.t;
+                used_lookup = used_lookup || a.lookup;
+                used_mtp = used_mtp || !a.lookup;
+            }
+        }
+        check(same, "fixed costs: timing cannot change learned policy decisions");
+        check(used_lookup && used_mtp, "fixed costs retain both lookup and MTP choices");
+    }
+    {
+        DraftPolicy p(8, 0.03, DraftPolicy::CostMode::FixedShape);
+        for (int i = 0; i < 40; ++i) p.observe(false, 4, 3, 0, 0);
+        check(p.choose(4, 7, 40).lookup, "fixed costs: unseen confident long window is probed");
+        for (int i = 0; i < 3; ++i) p.observe(true, 8, 0, 40, 0);
+        check(!p.choose(4, 7, 40).lookup, "fixed costs: finite probes and rejection learning retained");
+        for (int i = 0; i < 50; ++i) p.observe(true, 8, 7, 40, 0);
+        const auto pick = p.choose(2, 7, 40);
+        check(pick.lookup && pick.t > 2, "fixed costs: accepted long lookup remains enabled");
+    }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
 }
