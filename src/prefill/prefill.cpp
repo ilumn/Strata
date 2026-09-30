@@ -933,6 +933,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
+    if (yield_requested || on_yield) {
+        if (!yield_requested || !on_yield || m.T > 1024 || LB != 0 || LE != g.n_layers || next_ != nullptr) {
+            err = "prefill yield: requires paired callbacks, one device and a chunk of at most 1024";
+            return false;
+        }
+    }
     // the next stage reads chunk c on a thread while this one reads chunk c + 1 (declared first: an early return
     // waits for it before anything it reads goes away)
     std::string next_err;
@@ -1507,8 +1513,36 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     int32_t* src_h = grp_mapped ? m.grp_host + 2 * m.grp_tk : m.src_host.data();
                     if (grp_mapped) copy_i32(m.grp_dev, m.ids, T * K, m.cs);
                     else cudaMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
-                    cudaStreamSynchronize(m.cs);
+                    const auto group_status = cudaStreamSynchronize(m.cs);
                     pt.fold();
+                    // At <=1024 rows there is no whole-chunk copy issuer. The previous layer's stager
+                    // has left scope and this layer has not grouped/staged its experts yet. Keep the
+                    // entire run stack and arena alive while an unrelated, ready session decodes.
+                    if (yield_requested) {
+                        if (group_status != cudaSuccess) {
+                            err = std::string("prefill yield: prompt compute stream: ") + cudaGetErrorString(group_status);
+                            return false;
+                        }
+                        try {
+                            if (yield_requested()) {
+                                const auto copy_status = cudaStreamSynchronize(m.copy);
+                                if (copy_status != cudaSuccess) {
+                                    err = std::string("prefill yield: prompt copy stream: ") + cudaGetErrorString(copy_status);
+                                    return false;
+                                }
+                                if (!on_yield(err)) {
+                                    if (err.empty()) err = "prefill yield: decode callback failed";
+                                    return false;
+                                }
+                            }
+                        } catch (const std::exception& e) {
+                            err = std::string("prefill yield: callback exception: ") + e.what();
+                            return false;
+                        } catch (...) {
+                            err = "prefill yield: callback exception";
+                            return false;
+                        }
+                    }
                     std::fill(m.cnt.begin(), m.cnt.end(), 0);
                     for (int64_t i = 0; i < T * K; ++i) {
                         const int32_t e = ids_h[(size_t) i];

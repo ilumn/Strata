@@ -119,3 +119,18 @@ preset unchanged. No original measured-policy fix or unconditional parity
 claim. Standalone c1/c2/c3 performance, arbitrary arrival histories, full
 98304-token continuations and forced exhaustion remain outside these results.
 No code or binary changes during final reporting.
+# Prefill yield experiment
+
+Base `f7462a061a00acfa4848cd0a9bde0534bbed18fd`; isolated branch `experiment/prefill-yield`.
+
+Implemented opt-in `STRATA_PREFILL_YIELD=1` and optional `STRATA_PREFILL_YIELD_MS` (default 100ms).
+The original <=1024 prompt shapes remain intact; the existing MoE host-routing barrier drains prompt
+streams and services one round from the frozen set of ready other slots. Shared prompt arena stays
+owned by the suspended call. No admission/reset/prefill/input processing occurs recursively.
+Adaptation deadlines coalesce until the complete target+MTP chunk returns. Callback errors abort the
+server and scope cleanup clears callbacks. Default scheduling/body and pointer ordering retained.
+
+Source audit and `git diff --check` complete. CPU budget/simulated fairness test supplied but not built
+or run. No build, GPU run, preset change, trace change, or model qualification performed. Parent owns
+serialized build/model testing. See `docs/prefill-yield-prototype.md` for ownership proof, cancellation
+limits, adaptation/parity caveats, validation gates and independent build recipe.

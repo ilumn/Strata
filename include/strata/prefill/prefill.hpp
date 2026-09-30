@@ -92,6 +92,14 @@ public:
     /// Checked before every chunk: true stops the prompt early (`run` returns false with err "cancelled").
     std::function<bool()> should_stop;
 
+    /// Experimental single-device, <=1024-row service point at the existing MoE host-routing barrier.
+    /// Both callbacks must be set together. No prompt kernels change shape or order. On a requested yield,
+    /// both prompt streams are drained before on_yield; false (or an exception) aborts run with an error.
+    /// The owner must keep this session and the shared prompt arena untouched: no nested prefill, reset,
+    /// relayout, cache/residency mutation, or decoding this partially-prefilled session. Clear after run.
+    std::function<bool()> yield_requested;
+    std::function<bool(std::string& err)> on_yield;
+
     /// The vision path: HOST rows (n_embd floats) indexed by absolute position, read in place of the token
     /// embedding where non-null (an image's <|image_pad|> cells).  Null (default): every position embeds its token.
     const float* const* embd_rows = nullptr;
