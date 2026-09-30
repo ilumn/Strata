@@ -99,3 +99,63 @@ Decode throughput is 226.622 versus 240.144 TPS (+5.97%); wall throughput is
 not a promoted performance claim. Repeated pairs, default/stock regression
 and lifecycle gates remain outstanding. Original measured-policy output
 equivalence is not established or implied by this revised-policy pass.
+
+## Reversed long pair and cross-process repeatability
+
+The parent repeated the same long workload in reverse order (overlap first).
+Again all **9547 committed IDs and finish reasons match**. Comparing control
+against its previous control also matches all 9547 IDs/reasons, as does
+overlap against its previous overlap. Both cross-process comparisons have
+identical workloads, resolved arguments and binary hashes. All four processes
+resolve to 11172 actual expert-cache slots and report identical active-batch
+round counts: c1=14, c2=164, c3=138, c4=822. The c1 drain uses the existing
+single-drafter fallback; this does not qualify the separate c1 engine.
+
+| Pair/order | Control decode TPS | Overlap decode TPS | Decode gain | Wall gain |
+| --- | ---: | ---: | ---: | ---: |
+| 1, off then on | 226.622 | 240.144 | +5.97% | +5.46% |
+| 2, on then off | 218.682 | 236.921 | +8.34% | +7.16% |
+
+Control wall TPS in pair 2 is 210.137; overlap is 225.184. Absolute performance
+changes between sessions, so the two gains remain paired observations rather
+than a claim of one invariant improvement. Both comparisons retain normal
+adaptive placement, suffix lookup and fast kernels with fixed-shape proposal
+costs in both arms, explicit PCIe fraction 0.55 and unchanged 98304 context /
+2560 MiB reserve. Lightweight host profiling is enabled equally; detailed GPU
+timers and round tracing are off.
+
+For the reversed pair, 42 control / 41 overlap whole-machine samples taken
+approximately every two seconds including startup/warmup show GPU memory
+peaks of 28845 / 28847 MiB, available-RAM minima 3939.6 / 3981.7 MiB,
+temperature maxima 60 / 60 C and power maxima 324.56 / 334.08 W. These are
+sampled observations, not exact peaks. **The first long pair has no resource
+arrays**, so these measurements must not be attributed to that earlier pair.
+Matching cache capacity is established independently from all four stderr
+logs. Raw reversed artifacts are
+`../exports/strata-next/mtp-fixed-long-reverse-{off,on,parity}.json` plus
+adjacent stderr and `-resources.json` files.
+
+[Machine-readable evidence](mtp-parity-repair-results.json) includes both
+pairs and the two cross-run token comparisons. Third-pair seeded code and
+parent lifecycle checks remain gates before the final c4 disposition.
+This remains an explicit proposal-policy revision, with no claim of exact
+historical measured-policy output or arbitrary arrival-pattern equivalence.
+
+## Prepared seeded code confirmation
+
+CPU-only fixture `build-qualification/mtp-seeded-code-2048.json` copies the
+existing tuning cases code-merge, code-cache, code-parser and code-graph,
+preserving their token IDs (prompt lengths 47/47/47/49). Each requests 2048
+output tokens with `temperature=0.35 top_p=0.95 top_k=20 seed=42`, matching the
+requested sampling profile. It is in an ignored build directory; its manifest
+records the source hash and selection. Fixture SHA256:
+`99b0198e24b757808ed013d4023db4399909c2a0b420ab4e80528c03b7818f5b`.
+
+Parent-only command from the LocalLLMs directory:
+
+```powershell
+& .\Strata\.venv\Scripts\python.exe .\exports\strata-next\run_pair.py --repo Strata-mtp-parity-fix --exe Strata-mtp-parity-fix/build-mtp-cuda130/strata.exe --label mtp-fixed-seeded-code --flag STRATA_BATCH_DRAFT --env STRATA_DETERMINISTIC_DRAFT_POLICY=1 --set pcie-frac=0.55 --workload 'C:/Users/niran/Documents/Code Projects/LocalLLMs/Strata-mtp-parity-fix/build-qualification/mtp-seeded-code-2048.json'
+```
+
+The existing serial runner performs one off/on pair; the workload's max_new
+values supply the caps. Preparing the fixture does not run an engine.

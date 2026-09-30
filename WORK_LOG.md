@@ -70,3 +70,24 @@ IDs and finish reasons, normal adaptive fast kernels, PCIe0.55, 8192 caps,
 natural EOS. Decode226.622->240.144 (+5.97%); wall215.727->227.507 (+5.46%).
 Artifacts `../exports/strata-next/mtp-fixed-long-{off,on,parity}.json`.
 One pair only: no promotion; repeats/default/stock/lifecycle checks remain.
+
+## Reversed long confirmation and seeded fixture
+
+Parent reversed long pair passed all 9547 IDs and finish reasons. Independently
+compared off vs earlier off and on vs earlier on: both also match all 9547,
+with identical arguments/workload/binary. All four resolve 11172 cache slots
+and identical batch-round counts 1=14,2=164,3=138,4=822. Pair2 decode gain
+8.34%, wall gain7.16%; pair1 gain5.97%/5.46%. Performance varies by session,
+so preserve paired rates rather than invent a fixed speedup.
+
+Reverse-pair resource samples: GPU peak off/on28845/28847 MiB, RAM minima
+3939.6/3981.7 MiB, temperature60/60 C, power324.56/334.08 W. First pair has
+no resource arrays (not silently substituted). Analysis saved in the report
+and docs/mtp-parity-repair-results.json. No native code/binary changes.
+
+Generated ignored build-qualification/mtp-seeded-code-2048.json and manifest
+from four existing tuning code fixtures, retaining token IDs and setting
+temperature0.35/top_p0.95/top_k20/seed42, cap2048. Parent received exact serial
+runner command. Source SHA and generated SHA are recorded in the manifest;
+generated SHA99b0198e24b757808ed013d4023db4399909c2a0b420ab4e80528c03b7818f5b.
+Third workload pair/lifecycle remain pending before scoped c4 disposition.
