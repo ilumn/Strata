@@ -16,11 +16,13 @@
 #include <cstdlib>
 #include <cstdio>
 #include <deque>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <sstream>
 #include <thread>
 #include <unordered_set>
+#include <unordered_map>
 
 namespace strata::program {
 namespace {
@@ -206,6 +208,30 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
     auto& m = *impl_;
     const auto& c = m.config;
     const auto& g = *m.geometry;
+    // A separate diagnostic execution mode: force an identical continuation,
+    // commit one position per round and record full, unsampled row-zero logits.
+    // Speculative proposals still execute, but cannot change the compared prefix.
+    std::unordered_map<uint64_t, std::vector<int32_t>> forced;
+    std::ofstream numerical_trace;
+    const char* force_path = std::getenv("STRATA_DIAGNOSTIC_FORCE");
+    const char* trace_path = std::getenv("STRATA_DIAGNOSTIC_LOGITS");
+    if (force_path || trace_path) {
+        if (!force_path || !trace_path) { err = "diagnostic: force and logits paths required together"; return 1; }
+        std::ifstream file(force_path);
+        uint64_t id; size_t count;
+        while (file >> id >> count) {
+            if (!id || !count || count > (size_t)c.context || forced.count(id)) { err = "diagnostic: invalid fixture"; return 1; }
+            auto& tokens = forced[id]; tokens.resize(count);
+            for (auto& token : tokens)
+                if (!(file >> token) || token < 0 || token >= wt.find("output.weight")->ne1) {
+                    err = "diagnostic: invalid forced token"; return 1;
+                }
+        }
+        if (!file.eof() || forced.empty()) { err = "diagnostic: unreadable fixture"; return 1; }
+        numerical_trace.open(trace_path, std::ios::binary | std::ios::trunc);
+        if (!numerical_trace) { err = "diagnostic: cannot open logits output"; return 1; }
+        std::fprintf(stderr, "strata diagnostic: teacher forcing active; timings NOT performance evidence\n");
+    }
     if (!head || !head->loaded() || !wt.find("output.weight")) { err = "concurrency: native head required"; return 1; }
     if (!source || !host_res || !hits.d_res || cache.slots() < 1) {
         err = "concurrency: no profile-filled expert cache fits; reduce context/concurrency or increase available VRAM";
@@ -518,6 +544,20 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
                 int accepted = 0;
                 while (accepted < s.count - 1 && s.window[accepted + 1] == s.output[accepted]) ++accepted;
                 int keep = accepted + 1;
+                const auto forced_it = forced.find(s.request.id);
+                if (forced_it != forced.end()) {
+                    if ((size_t)s.generated >= forced_it->second.size()) { err = "diagnostic: continuation exhausted"; return false; }
+                    if (s.generated % 16 == 0) {
+                        std::vector<float> logits;
+                        if (!s.verify.diagnostic_logits(logits, err)) return false;
+                        const uint64_t header[] = {s.request.id, (uint64_t)s.generated, (uint64_t)s.position, (uint64_t)logits.size()};
+                        numerical_trace.write((const char*)header, sizeof(header));
+                        numerical_trace.write((const char*)logits.data(), logits.size() * sizeof(float));
+                        if (!numerical_trace) { err = "diagnostic: logits write failed"; return false; }
+                    }
+                    s.output[0] = forced_it->second[(size_t)s.generated];
+                    keep = 1;
+                }
                 bool eos = false;
                 for (int t = 0; t < keep; ++t) if (std::find(c.eos.begin(), c.eos.end(), s.output[t]) != c.eos.end()) {
                     keep = t + 1; eos = true; break;
@@ -592,6 +632,9 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
             Request request;
             std::string reason;
             if (!parse_request(line, c, wt.find("output.weight")->ne1, request, reason)) { error(request.id, reason); continue; }
+            if (forced.count(request.id) && (size_t)request.max_new > forced.at(request.id).size()) {
+                error(request.id, "diagnostic continuation shorter than output cap"); continue;
+            }
             if (live.count(request.id)) { error(request.id, "duplicate request id"); continue; }
             if (pending.size() >= 16) { error(request.id, "request queue is full"); continue; }
             live.insert(request.id);
