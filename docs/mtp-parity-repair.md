@@ -36,7 +36,10 @@ off. Equalizing observation boundaries alone cannot remove this feedback.
 
 Different speculative rows enter target expert routing and usage counts,
 even when rejected. This pair crosses an adaptive placement boundary after
-round 767. The trace establishes policy divergence before emitted divergence;
+round 767. Batch padding is enabled: both physical target windows have four
+rows, but the control pads its fourth row with current token `279` whereas
+overlap evaluates suffix token `381` there. Equal padded shapes therefore do
+not imply equal target inputs. The trace establishes policy divergence before emitted divergence;
 it does not contain per-layer arithmetic or residency traces proving every
 subsequent propagation step. No claim of harmless numerical divergence is
 made.
@@ -76,3 +79,10 @@ Run the diagnostic tool with the existing virtual environment:
 Native build directory: `build-mtp-cuda130`, CUDA 13.0, MSVC 14.32, Release,
 `120-real`, native experts, portable runtime. All model/GPU tests are
 serialized and launched by the parent coordinator, never this worker.
+
+Build succeeded at implementation checkpoint `bd4fb7c`. Executable SHA256:
+`09d110bffdad3465504bbb907ef16a48d5cc6549ffcff495903782ebb0176d8a`.
+The parent has the binary for long revised-policy off/on qualification.
+At this handoff, exact normal long parity with the **original measured
+policy remains failed**; revised-policy model parity and performance are
+pending. Neither experimental flag is promoted.

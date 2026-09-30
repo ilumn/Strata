@@ -57,3 +57,10 @@ Native independent serial build is running in `build-mtp-cuda130`, approved
 by parent after old reproduction completed and models stopped. CUDA13.0,
 MSVC14.32, architecture120-real, portable/native experts, Release. No GPU or
 model test was launched by this worker.
+
+Build completed successfully (exit 0). Candidate executable SHA256:
+`09d110bffdad3465504bbb907ef16a48d5cc6549ffcff495903782ebb0176d8a`.
+Implementation checkpoint: `bd4fb7c`. Parent notified that the binary is
+ready for the serialized normal-settings long off/on pair at the new policy.
+At handoff, revised-policy model parity/performance is still pending and
+exact original measured-policy long parity remains failed/unresolved.
