@@ -86,3 +86,16 @@ The parent has the binary for long revised-policy off/on qualification.
 At this handoff, exact normal long parity with the **original measured
 policy remains failed**; revised-policy model parity and performance are
 pending. Neither experimental flag is promoted.
+
+## First revised-policy long pair (parent validation)
+
+The parent subsequently ran normal adaptive c4 with fast kernels, PCIe
+fraction 0.55, 8192-token caps and fixed-shape policy enabled in both arms.
+All four essays finish naturally: **9547 committed token IDs and finish
+reasons match exactly**. Artifacts are
+`../exports/strata-next/mtp-fixed-long-{off,on,parity}.json` with adjacent logs.
+Decode throughput is 226.622 versus 240.144 TPS (+5.97%); wall throughput is
+215.727 versus 227.507 TPS (+5.46%). These are one preliminary paired trial,
+not a promoted performance claim. Repeated pairs, default/stock regression
+and lifecycle gates remain outstanding. Original measured-policy output
+equivalence is not established or implied by this revised-policy pass.

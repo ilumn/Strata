@@ -64,3 +64,9 @@ Implementation checkpoint: `bd4fb7c`. Parent notified that the binary is
 ready for the serialized normal-settings long off/on pair at the new policy.
 At handoff, revised-policy model parity/performance is still pending and
 exact original measured-policy long parity remains failed/unresolved.
+
+Parent's first revised-policy long pair subsequently passed all 9547 emitted
+IDs and finish reasons, normal adaptive fast kernels, PCIe0.55, 8192 caps,
+natural EOS. Decode226.622->240.144 (+5.97%); wall215.727->227.507 (+5.46%).
+Artifacts `../exports/strata-next/mtp-fixed-long-{off,on,parity}.json`.
+One pair only: no promotion; repeats/default/stock/lifecycle checks remain.
