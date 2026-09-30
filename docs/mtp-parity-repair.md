@@ -1,5 +1,13 @@
 # Experimental deterministic concurrent draft policy
 
+**Final disposition:** qualify the tested c4 **explicit revised-policy opt-in**
+(`STRATA_DETERMINISTIC_DRAFT_POLICY=1` plus `STRATA_BATCH_DRAFT=1`). Three c4
+pairs pass exact IDs/finish reasons, c1–c4 strict stock regressions pass, and
+all 19 lifecycle checks pass. Both flags remain off by default and the daily
+preset is unchanged. This does **not** repair or establish exact parity for
+the original measured-cost policy. The sections below preserve causal evidence
+and the sequence of qualification gates.
+
 This branch starts from `3a51c84`, preserving the experimental overlapped MTP
 implementation. `STRATA_BATCH_DRAFT` stays **off by default**. The new
 `STRATA_DETERMINISTIC_DRAFT_POLICY=1` is also opt-in and affects only the
@@ -159,3 +167,64 @@ Parent-only command from the LocalLLMs directory:
 
 The existing serial runner performs one off/on pair; the workload's max_new
 values supply the caps. Preparing the fixture does not run an engine.
+
+## Seeded code confirmation and lifecycle
+
+Parent ran the prepared workload with the requested temperature 0.35,
+top-p 0.95, top-k 20 and seed 42. All **6385 IDs and finish reasons match**:
+code-merge emits 785 (`stop`), code-cache 2048 (`length`), code-parser 2048
+(`length`) and code-graph 1504 (`stop`). Per-request draft accepted/offered
+counts also match. This exercises seeded sampling and differing completion
+lengths with normal adaptive/fast-kernel settings, rather than only greedy
+essay prompts.
+
+Control/overlap decode TPS is 202.188 / 213.478 (**+5.58%**), and wall TPS is
+201.243 / 210.232 (**+4.47%**). Both arms resolve to 11172 actual cache slots.
+Each has 35 whole-machine resource samples: GPU memory peaks 28932 / 28931
+MiB, available-RAM minima 3729.1 / 3775.3 MiB, maximum temperature 56 / 55 C
+and power 254.10 / 261.73 W. Sampling limitations are the same as above.
+Artifacts: `../exports/strata-next/mtp-fixed-seeded-code-{off,on,parity}.json`,
+adjacent stderr and `-resources.json` files.
+
+`mtp-fixed-lifecycle.json` reports all **19 lifecycle checks passed** with
+the candidate binary: queued/prefill/decode cancellation, two unaffected
+request continuations, twelve slot-reuse comparisons, invalid-request
+rejection and valid-request recovery. Its stderr confirms fixed-shape policy
+and overlap enabled under static strict controls (6297 actual cache slots).
+These lifecycle checks do not establish arbitrary adaptive-arrival parity.
+
+Together the three c4 pairs compare 25479 emitted IDs with exact per-pair
+finish reasons (two greedy repetitions and one seeded code workload).
+Paired decode gains range 5.58%–8.34%, wall gains 4.47%–7.16%; medians are
+5.97% and 5.46% across these selected workloads. This is scoped evidence for
+the explicit fixed-shape-policy plus overlap experiment, not a repair that
+makes the original measured policy token-equivalent. Source defaults remain
+unchanged, both flags stay opt-in, and the daily preset is not modified.
+Capacity results subsequently complete the requested strict regression matrix.
+
+## Final capacity regression and scope
+
+Parent c1, c2 and c3 strict runs each match all 18 published-stock fixture
+responses: **2409 IDs and finish reasons per capacity**. Combined with the
+existing c4 stock comparison this is 72 responses / 9636 output tokens, plus
+the separate c4 off/on fixture comparison. Every run uses the candidate hash
+`09d110bffdad3465504bbb907ef16a48d5cc6549ffcff495903782ebb0176d8a` and resolves
+to 6297 actual cache slots under fixed numerical controls. c1 ignores the
+concurrent-policy and overlap flags, so its pass is a regression check rather
+than evidence that c1 benefited from the optimization.
+
+Raw status: `../exports/strata-next/mtp-capacity-status.json`; raw runs and
+per-request stock comparisons: `mtp-fixed-c{1,2,3}-strict.json` and
+`mtp-fixed-c{1,2,3}-strict-stock-parity.json`. c4 artifacts are
+`mtp-fixed-strict-{off,on,parity}.json` and `mtp-fixed-stock-parity.json`.
+All status exit codes are zero; every request comparison reports equality.
+
+The qualified result is a c4 experimental configuration with unchanged
+sampling controls, suffix lookup and adaptive expert residency, using a
+revised **deterministic relative-cost** policy in both arms. It has demonstrated
+the above performance/parity benefit on the selected long-form and seeded
+workloads. Performance at standalone c1/c2/c3, arbitrary arrival histories,
+full 98304-token continuations and forced context exhaustion is not established
+by these tests. The 98304 setting here is the allocated per-request context
+limit, not the tested input length. No unconditional historical-output or
+production-parity guarantee is made, and no automatic daily deployment occurs.

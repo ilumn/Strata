@@ -105,6 +105,60 @@
       "differences": [],
       "decode_gain_percent": 8.340417736523897,
       "wall_gain_percent": 7.16065907122958
+    },
+    {
+      "label": "mtp-fixed-seeded-code",
+      "arms": {
+        "off": {
+          "sha256": "09d110bffdad3465504bbb907ef16a48d5cc6549ffcff495903782ebb0176d8a",
+          "tokens": 6385,
+          "requests": 4,
+          "decode_tps": 202.18815545992933,
+          "wall_tps": 201.24335298085657,
+          "environment": {
+            "STRATA_BATCH_DRAFT": "0",
+            "STRATA_DETERMINISTIC_DRAFT_POLICY": "1",
+            "STRATA_CONCURRENT_PROFILE": "1"
+          },
+          "actual_cache_slots": [
+            "11172"
+          ],
+          "resource_samples": {
+            "samples": 35,
+            "minimum_available_ram_mib": 3729.1171875,
+            "max_gpu_memory_mib": 28932.0,
+            "max_gpu_power_w": 254.1,
+            "max_gpu_temperature_c": 56.0
+          }
+        },
+        "on": {
+          "sha256": "09d110bffdad3465504bbb907ef16a48d5cc6549ffcff495903782ebb0176d8a",
+          "tokens": 6385,
+          "requests": 4,
+          "decode_tps": 213.47814461668935,
+          "wall_tps": 210.23249942992817,
+          "environment": {
+            "STRATA_BATCH_DRAFT": "1",
+            "STRATA_DETERMINISTIC_DRAFT_POLICY": "1",
+            "STRATA_CONCURRENT_PROFILE": "1"
+          },
+          "actual_cache_slots": [
+            "11172"
+          ],
+          "resource_samples": {
+            "samples": 35,
+            "minimum_available_ram_mib": 3775.34375,
+            "max_gpu_memory_mib": 28931.0,
+            "max_gpu_power_w": 261.73,
+            "max_gpu_temperature_c": 55.0
+          }
+        }
+      },
+      "exact_match": true,
+      "differences": [],
+      "decode_gain_percent": 5.5839023463456705,
+      "wall_gain_percent": 4.46680415324161,
+      "sampling": "temperature=0.35 top_p=0.95 top_k=20 seed=42"
     }
   ],
   "cross_run": {
@@ -122,5 +176,92 @@
       "exact_match": true,
       "differences": []
     }
+  },
+  "lifecycle": {
+    "complete": true,
+    "checks": {
+      "decode_cancel": true,
+      "prefill_cancel": true,
+      "queued_cancel": true,
+      "survivor_102_parity": true,
+      "survivor_103_parity": true,
+      "reuse_201_parity": true,
+      "reuse_202_parity": true,
+      "reuse_203_parity": true,
+      "reuse_204_parity": true,
+      "reuse_211_parity": true,
+      "reuse_212_parity": true,
+      "reuse_213_parity": true,
+      "reuse_214_parity": true,
+      "reuse_221_parity": true,
+      "reuse_222_parity": true,
+      "reuse_223_parity": true,
+      "reuse_224_parity": true,
+      "invalid_request_rejected": true,
+      "valid_after_invalid_parity": true
+    },
+    "sha256": "09d110bffdad3465504bbb907ef16a48d5cc6549ffcff495903782ebb0176d8a",
+    "exit_code": 0,
+    "artifact": "../exports/strata-next/mtp-fixed-lifecycle.json"
+  },
+  "scope": "Explicit revised fixed-shape policy plus MTP overlap, opt-in; c4 performance; original measured-policy parity not repaired",
+  "strict_stock_regression": [
+    {
+      "concurrency": 1,
+      "requests": 18,
+      "tokens": 2409,
+      "all_equal": true,
+      "artifact": "../exports/strata-next/mtp-fixed-c1-strict-stock-parity.json",
+      "actual_cache_slots": 6297
+    },
+    {
+      "concurrency": 2,
+      "requests": 18,
+      "tokens": 2409,
+      "all_equal": true,
+      "artifact": "../exports/strata-next/mtp-fixed-c2-strict-stock-parity.json",
+      "actual_cache_slots": 6297
+    },
+    {
+      "concurrency": 3,
+      "requests": 18,
+      "tokens": 2409,
+      "all_equal": true,
+      "artifact": "../exports/strata-next/mtp-fixed-c3-strict-stock-parity.json",
+      "actual_cache_slots": 6297
+    },
+    {
+      "concurrency": 4,
+      "requests": 18,
+      "tokens": 2409,
+      "all_equal": true,
+      "artifact": "../exports/strata-next/mtp-fixed-stock-parity.json",
+      "actual_cache_slots": 6297
+    }
+  ],
+  "capacity_status": {
+    "mtp-fixed-c1-strict": 0,
+    "mtp-fixed-c1-strict-stock": 0,
+    "mtp-fixed-c2-strict": 0,
+    "mtp-fixed-c2-strict-stock": 0,
+    "mtp-fixed-c3-strict": 0,
+    "mtp-fixed-c3-strict-stock": 0
+  },
+  "disposition": {
+    "qualified_scope": "Tested c4 explicit fixed-shape proposal policy plus MTP overlap opt-in",
+    "flags": {
+      "STRATA_DETERMINISTIC_DRAFT_POLICY": "1",
+      "STRATA_BATCH_DRAFT": "1"
+    },
+    "default_flags_changed": false,
+    "daily_preset_changed": false,
+    "original_measured_policy_exact_parity_established": false,
+    "performance_scope": "Two greedy long-form pairs and one seeded code pair, all exact IDs/finish reasons",
+    "unqualified": [
+      "standalone c1/c2/c3 performance",
+      "arbitrary arrival histories",
+      "full 98304-token continuations",
+      "forced context exhaustion"
+    ]
   }
 }

@@ -91,3 +91,31 @@ temperature0.35/top_p0.95/top_k20/seed42, cap2048. Parent received exact serial
 runner command. Source SHA and generated SHA are recorded in the manifest;
 generated SHA99b0198e24b757808ed013d4023db4399909c2a0b420ab4e80528c03b7818f5b.
 Third workload pair/lifecycle remain pending before scoped c4 disposition.
+
+## Seeded confirmation and lifecycle received
+
+Parent seeded code pair passed exact6385 IDs/finish reasons:785stop,
+2048length,2048length,1504stop. Accepted/offered counts match. Decode gain
+5.5839%, wall4.4668%, actual11172 cache slots both.35 resource samples each
+show peak GPU28932/28931 MiB, RAM minima3729.1/3775.3 MiB, temperature56/55 C,
+power254.10/261.73 W. All19 parent lifecycle checks pass; correctbinary,
+fixed-shape+overlap1, strict staticcache6297 confirmed in stderr.
+Capacity c1/c2/c3 strict stock checks pending before final report commit.
+Conclusion remains explicitly revised-policy experimental c4 evidence;
+original measured-policy output equivalence remains unclaimed.
+
+## Final scoped qualification
+
+Parent capacity status completes c1/c2/c3 strict stock regression: each18
+responses/2409 IDs and finish reasons exact, all exit0, actualcache6297.
+With c4 this is72 stock comparisons/9636 tokens, alongside the c4 off/on
+fixture pair, three performance pairs/25479 compared IDs and19 lifecycle
+checks. Candidate hash unchanged. c1 ignores concurrent flags and is only
+a regression check. Raw per-request comparisons independently inspected.
+
+Disposition: qualify only the tested explicit revised fixed-shape-policy
+plus overlap experimental opt-in for c4; keep both defaults off and daily
+preset unchanged. No original measured-policy fix or unconditional parity
+claim. Standalone c1/c2/c3 performance, arbitrary arrival histories, full
+98304-token continuations and forced exhaustion remain outside these results.
+No code or binary changes during final reporting.
