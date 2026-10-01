@@ -19,6 +19,9 @@ class NumericalTests(unittest.TestCase):
         self.assertFalse(result['top1_equal']); self.assertLess(result['kl'],1e-9)
     def test_nonfinite_rejected(self):
         with self.assertRaises(ValueError): mod.metrics(np.array([1.,float('nan')]),np.array([1.,2.]))
+    def test_teacher_likelihood_reports_direction(self):
+        result=mod.metrics(np.array([10.,0.,-1.]),np.array([0.,10.,-1.]),teacher=0)
+        self.assertGreater(result['teacher_nll_b']-result['teacher_nll_a'],9)
     def test_truncated_trace(self):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'x'; path.write_bytes(struct.pack('<QQQQ',100,0,50,3)+b'1234')

@@ -494,7 +494,8 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
                         w.count = (int) std::min<int64_t>(std::max(w.count, c.mtp_window_rows), c.context - w.position);
             }
             // Logical slot order is stable across launches. Heap-address order can
-            // change which missed experts run on CPU versus GPU and hence rounding.
+            // change packed row/reduction order and hence floating-point rounding.
+            // Concurrent PCIe miss offload is currently disabled (pcie_num is zero).
             // Fairness still rotates admission; packing must not rotate with it.
             auto slot_index = [&](const core::Verifier* verifier) {
                 for (size_t i = 0; i < m.slots.size(); ++i)

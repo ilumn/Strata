@@ -23,14 +23,20 @@ ARMS={
  'mtp_measured':(CAND,{'STRATA_BATCH_DRAFT':'1'},{}),
  'depth2':(CAND,{}, {'spec':'2','batch-rows':'8'}),
  'depth3':(CAND,{}, {'spec':'3','batch-rows':'12'}),
+ 'depth2_mtp':(CAND,{'STRATA_BATCH_DRAFT':'1'}, {'spec':'2','batch-rows':'8'}),
+ 'depth2_yield':(CAND,{'STRATA_PREFILL_YIELD':'1'}, {'spec':'2','batch-rows':'8'}),
+ 'depth2_combined':(CAND,{'STRATA_BATCH_DRAFT':'1','STRATA_PREFILL_YIELD':'1'}, {'spec':'2','batch-rows':'8'}),
  'yield':(CAND,{'STRATA_PREFILL_YIELD':'1'},{}),
+ 'yield50':(CAND,{'STRATA_PREFILL_YIELD':'1','STRATA_PREFILL_YIELD_MS':'50'},{}),
+ 'yield200':(CAND,{'STRATA_PREFILL_YIELD':'1','STRATA_PREFILL_YIELD_MS':'200'},{}),
  'combined':(CAND,{'STRATA_DETERMINISTIC_DRAFT_POLICY':'1','STRATA_BATCH_DRAFT':'1','STRATA_PREFILL_YIELD':'1'},{}),
+ 'combined_measured':(CAND,{'STRATA_BATCH_DRAFT':'1','STRATA_PREFILL_YIELD':'1'},{}),
  'F':(FROZEN,{},{}),
 }
 
 def sha(path): return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
-def run(label,arm,phase,fixture,force=None,strict=False):
+def run(label,arm,phase,fixture,force=None,strict=False,capacity=4,cache=10500):
     exe,overrides,settings=ARMS[arm]
     output=OUT/(label+'.json')
     if output.exists(): raise FileExistsError(output)
@@ -44,8 +50,9 @@ def run(label,arm,phase,fixture,force=None,strict=False):
              '--config',str(ROOT/'Strata-concurrency/strata-c4-local.json'),'--exe',str(exe),
              '--output',str(output),'--workload',str(fixture),'--repeat','1']
     if strict: command+=['--strict']
-    common={'prefill':'1024','concurrent-prefill':'1024','pool-workers':'15','expert-cache':'11000',
-            'pcie-frac':'0','prompt-cache':'0'}
+    common={'prefill':'1024','concurrent-prefill':'1024','pool-workers':'15','expert-cache':str(cache),
+            'pcie-frac':'0','prompt-cache':'0','concurrency':str(capacity)}
+    if phase in ('qualify','long'): common['expert-cache']='6000'
     common.update(settings)
     for key,value in common.items(): command+=['--set',key+'='+value]
     if phase in ('numeric','overlap'): command+=['--stagger-after','64']
@@ -69,29 +76,43 @@ def fixture(name,source,cap):
     return path
 
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('phase',choices=['smoke','numeric','decode','overlap'])
+    ap=argparse.ArgumentParser(); ap.add_argument('phase',choices=['smoke','qualify','long','numeric','decode','overlap'])
     ap.add_argument('--arms',nargs='+',required=True,choices=ARMS); ap.add_argument('--prefix',required=True)
+    ap.add_argument('--capacity',type=int,choices=[1,2,3,4],default=4)
+    ap.add_argument('--dataset',choices=['essay','code'],default='essay')
     args=ap.parse_args(); OUT.mkdir(exist_ok=True)
     overlap=args.phase in ('numeric','overlap')
-    cap=512 if args.phase=='numeric' else 256 if args.phase=='smoke' else 1024 if overlap else 2048
+    cap=512 if args.phase=='numeric' else 256 if args.phase=='smoke' else 1024 if overlap else 4096 if args.phase=='long' else 2048
     source='exports/strata-responsiveness/'+('base-repeat-0-chunk1024.json' if overlap else 'decode-base-0-chunk1024.json')
-    work=fixture(args.phase+'-fixture.json',source,cap)
+    if args.dataset=='code': source='exports/strata-next/mtp-fixed-seeded-code-off.json'
+    fixture_name=('code-' if args.dataset=='code' else '')+args.phase+'-fixture.json'
+    work=ROOT/'exports/strata-ab/qualification-cases.json' if args.phase=='qualify' else fixture(fixture_name,source,cap)
     force=None
     if args.phase=='numeric':
         saved=json.loads((ROOT/source).read_text())['runs'][0]['requests']
-        force=OUT/'force.txt'
+        force=OUT/('force-code.txt' if args.dataset=='code' else 'force.txt')
+        assert all(len(item['tokens'])>=cap for item in saved.values()), 'source continuation too short'
         content='\n'.join(f'{rid} {cap} '+ ' '.join(map(str,item['tokens'][:cap])) for rid,item in saved.items())+'\n'
         if force.exists(): assert force.read_text()==content
         else: force.write_text(content)
     reports={}
+    baseline_kl=None
     for i,arm in enumerate(args.arms):
         label=f'{args.prefix}-{i}-{arm}'
-        reports[label]=run(label,arm,args.phase,work,force,args.phase=='smoke')
+        reports[label]=run(label,arm,args.phase,work,force,args.phase in ('smoke','qualify','long'),args.capacity)
+        if args.phase=='numeric':
+            for rid,item in reports[label]['runs'][0]['requests'].items():
+                assert item['tokens']==saved[rid]['tokens'][:cap], 'teacher continuation not followed'
         if args.phase=='numeric' and len(reports)>1:
             first=next(iter(reports)); result=compare(OUT/(first+'.logits'),OUT/(label+'.logits'))
+            if i==1 and args.arms[0]==arm=='R': baseline_kl=result['mean_kl']
+            if baseline_kl is not None:
+                result['base_repeat_mean_kl']=baseline_kl
+                result['relative_screen_limit']=max(2*baseline_kl,0.0001)
+                result['relative_screen_pass']=result['mean_kl']<=result['relative_screen_limit']
             (OUT/(label+'-numerical.json')).write_text(json.dumps(result,indent=2))
             print('NUMERICAL',label,json.dumps({k:v for k,v in result.items() if k!='rows'}),flush=True)
-        elif args.phase=='smoke' and len(reports)>1:
+        elif args.phase in ('smoke','qualify','long') and len(reports)>1:
             result=parity(next(iter(reports.values())),reports[label])
             (OUT/(label+'-parity.json')).write_text(json.dumps(result,indent=2))
             print('PARITY',result,flush=True)

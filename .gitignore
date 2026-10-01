@@ -50,4 +50,5 @@ tests/concurrency/*.exe
 tests/concurrency/*.obj
 /build-concurrency/
 /run-concurrency-local.ps1
+/local-candidate/
 

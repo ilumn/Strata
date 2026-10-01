@@ -18,6 +18,8 @@ Original frozen f7462a0 remains a reference. Diagnostic instrumentation necessar
 
 Use equal fixed actual expert capacity, fast CPU kernels and adaptive cache enabled. Independent performance runs have no teacher forcing/logit instrumentation. Report committed aggregate TPS, natural completion and token counts across prose and coding; retain differing-output runs as diagnostic throughput observations with work-length caveats. Confirm finalists in alternating repeated trials, not one lucky run.
 
+Resource adjustment after the first decode screen: request10500 slots (11022 actual), down from11000 (11546 actual). The combined arm tripped the2560MiB guard during late graph growth at the larger cache. All subsequent paired qualification uses the smaller equal cache; do not mix cache sizes into a claimed paired gain. The requested reserve remains2560MiB.
+
 Responsiveness gates: halve total inter-token gap burden above250ms, incoming TTFT<=2x BASE, workflow duration<=1.10x BASE, independent decode-only regression<=3%; positive concurrent decode/prefill tradeoff. Five fresh pairs for final responsiveness qualification, plus repeated arrivals and cancellation/reuse. No paging or abandoned resident engines.
 
 Check available llama.cpp architecture support without installing/downloading a second large model. Lack of a compatible independent engine does not block internal investigation, but must be disclosed as a validation limitation.
