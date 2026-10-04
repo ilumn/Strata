@@ -27,7 +27,8 @@ struct ConcurrentConfig {
     int reserve_mib = 1536, suffix = 0;
     int adapt_every = 4, adapt_swaps = 96;
     float spec_min_p = 0.5f;
-    std::string mtp_dir;
+    std::string mtp_dir, kv = "int8";
+    bool vision = false;
     std::vector<int64_t> eos;
 };
 class ConcurrentServe {

@@ -37,6 +37,7 @@
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/mrope.hpp"
+#include "strata/core/layer_range.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
@@ -1120,11 +1121,11 @@ int main(int argc, char** argv) {
 #if defined(STRATA_USE_HIP)
         std::fprintf(stderr, "strata: concurrent serving currently requires NVIDIA CUDA\n"); return 2;
 #endif
-        if (!o.serve || o.native_preset.empty() || o.mtp.empty() || o.spec < 2 || o.spec > 8 || o.kv != "int8" ||
-            o.vision || o.spec_split ||
+        if (!o.serve || o.native_preset.empty() || o.mtp.empty() || o.spec < 2 || o.spec > 8 || (o.kv != "int8" && o.kv != "fp16") ||
+            o.spec_split ||
             !o.cvec_files.empty() || o.kv_resident || o.expert_cache_remote[0] || o.expert_cache_remote[1] ||
             o.expert_cache_remote[2] || o.expert_profile.empty() || o.expert_cache == 0 || o.no_pool || o.no_capture) {
-            std::fprintf(stderr, "strata: concurrency requires --serve, native experts, MTP/spec, int8 resident KV and a profile-filled cache; vision, control vectors, split verify, KV streaming and helper expert caches are not supported\n");
+            std::fprintf(stderr, "strata: concurrency requires --serve, native experts, MTP/spec, fp16 or int8 resident KV and a profile-filled cache; control vectors, split verify, KV streaming and helper expert caches are not supported\n");
             return 2;
         }
     }
@@ -1435,8 +1436,23 @@ int main(int argc, char** argv) {
         if (!native_pack) skip.erase("blk.1.ple_key.weight");
         if (native_pack) skip.insert("token_embd.weight");
     }
+    const bool compact_sessions = multi_gpu && !split_auto && o.concurrency > 1;
+    const int64_t primary_end = compact_sessions ? split_at[0] : strata::core::ModelGeometry{}.n_layers;
+    auto stage_skip = [&](int64_t lb, int64_t le) {
+        auto names = skip;
+        if (compact_sessions) {
+            std::ifstream index(o.pack + "/index.txt");
+            std::string line, name;
+            while (std::getline(index, line)) {
+                std::istringstream row(line);
+                if (row >> name && !strata::core::weight_in_layer_range(name, lb, le)) names.insert(name);
+            }
+        }
+        return names;
+    };
+    const auto primary_skip = stage_skip(0, primary_end);
     uint64_t pool_bytes = 0;
-    if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
+    if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, primary_skip.empty() ? nullptr : &primary_skip)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
         return 1;
     }
@@ -1447,7 +1463,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     strata::core::WeightTable wt;
-    if (!wt.load(o.pack, arena, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
+    if (!wt.load(o.pack, arena, pool_bytes, err, primary_skip.empty() ? nullptr : &primary_skip)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
         return 1;
     }
@@ -1457,7 +1473,7 @@ int main(int argc, char** argv) {
 
     strata::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
-        if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
+        if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key, 0, primary_end)) {
             std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
             return 1;
         }
@@ -1534,7 +1550,7 @@ int main(int argc, char** argv) {
     }
 
     void* sbuf = nullptr;
-    if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K)) != cudaSuccess) {
+    if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, primary_end)) != cudaSuccess) {
         std::fprintf(stderr, "strata generate: session state allocation failed\n");
         return 1;
     }
@@ -1552,10 +1568,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     void* const main_cs = (void*) main_stream;
-    if (strata::core::session_init(g, o.max_context, K, sbuf, ss) == 0) {
+    if (strata::core::session_init(g, o.max_context, K, sbuf, ss, 0, primary_end) == 0) {
         std::fprintf(stderr, "strata generate: session_init failed\n");
         return 1;
     }
+    ss.mrope = d_mrope;
     if (g.n_qsa_layers() > 0 && ss.qsa_states[0].kv_mode == 1)
         std::fprintf(stderr, "strata generate: KV streaming: %lld of %lld cells per QSA layer in VRAM, the K/V in "
                              "%.2f GiB of pinned RAM\n", (long long) (ss.qsa_states[0].n_slots * 4),
@@ -1693,21 +1710,26 @@ int main(int argc, char** argv) {
             return 1;
         }
         const strata::core::OnDevice on(st.dev);
+        const int64_t state_lb = compact_sessions ? split_at[i] : 0;
+        const int64_t state_le = compact_sessions && i + 1 < split_at.size() ? split_at[i+1] : g.n_layers;
+        const auto weights_skip = stage_skip(state_lb, state_le);
+        uint64_t stage_weight_bytes = 0;
         void* arena_s = nullptr;
-        if (cudaMalloc(&arena_s, pool_bytes) != cudaSuccess ||
-            !st.wt.load(o.pack, arena_s, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
+        if (!strata::core::WeightTable::pool_bytes(o.pack, stage_weight_bytes, err, &weights_skip) ||
+            cudaMalloc(&arena_s, stage_weight_bytes) != cudaSuccess ||
+            !st.wt.load(o.pack, arena_s, stage_weight_bytes, err, &weights_skip)) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d weights: %s\n", st.dev,
                          err.empty() ? "the weight arena does not fit" : err.c_str());
             return 1;
         }
-        if (!o.native_dense_gguf.empty() && !st.dense.load(o.native_dense_gguf, st.wt, err, o.native_ple_key)) {
+        if (!o.native_dense_gguf.empty() && !st.dense.load(o.native_dense_gguf, st.wt, err, o.native_ple_key, state_lb, state_le)) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d native dense projections: %s\n", st.dev,
                          err.c_str());
             return 1;
         }
         void* sbuf_s = nullptr;
-        if (cudaMalloc(&sbuf_s, strata::core::session_bytes(g, o.max_context, K)) != cudaSuccess ||
-            strata::core::session_init(g, o.max_context, K, sbuf_s, st.ss) == 0 ||
+        if (cudaMalloc(&sbuf_s, strata::core::session_bytes(g, o.max_context, K, state_lb, state_le)) != cudaSuccess ||
+            strata::core::session_init(g, o.max_context, K, sbuf_s, st.ss, state_lb, state_le) == 0 ||
             cudaStreamCreateWithFlags(&st.stream, cudaStreamNonBlocking) != cudaSuccess ||
             cudaStreamCreateWithFlags(&st.adapt_stream, cudaStreamNonBlocking) != cudaSuccess ||
             cudaEventCreateWithFlags(&st.adapt_ev, cudaEventDisableTiming) != cudaSuccess) {
@@ -1736,6 +1758,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
             strata::kernels::mrope_table_set(st.mrope);
+            st.ss.mrope = st.mrope;
         }
         // its own PCIe share of the missed experts (the same rule as CUDA0's above: its link is probed)
         st.pcie_frac = o.pcie_frac;
@@ -1779,6 +1802,7 @@ int main(int argc, char** argv) {
         config.prefill_chunk = o.concurrent_prefill; config.context = o.max_context; config.draft_context = o.mtp_window;
         config.reserve_mib = o.vram_reserve_mib; config.mtp_dir = o.mtp; config.spec_min_p = (float) o.spec_min_p;
         config.suffix = o.suffix_draft; config.eos = o.eos_ids;
+        config.kv = o.kv; config.vision = o.vision;
         config.adapt_every = o.adapt_every; config.adapt_swaps = o.adapt_swaps;
         concurrent = std::make_unique<strata::program::ConcurrentServe>(config);
         if (split_same) {

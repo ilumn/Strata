@@ -1,4 +1,5 @@
 #include "strata/core/native_dense.hpp"
+#include "strata/core/layer_range.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -58,7 +59,7 @@ NativeDense::~NativeDense() {
 }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
-                       bool include_ple_key) {
+                       bool include_ple_key, int64_t layer_begin, int64_t layer_end) {
     if (scratch_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
     try {
@@ -131,6 +132,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 if (!seen.insert(tensor.name).second) {
                     err = "native dense: duplicate tensor " + tensor.name; return false;
                 }
+                if (!weight_in_layer_range(tensor.name, layer_begin, layer_end)) continue;
                 auto found = table.table_.find(tensor.name);
                 if (found == table.table_.end()) {
                     err = "native dense: tensor absent from canonical table: " + tensor.name; return false;

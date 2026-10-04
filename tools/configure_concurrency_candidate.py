@@ -8,9 +8,18 @@ import json
 from pathlib import Path
 
 
-def configure(source: dict, engine: Path, context: int, reserve: int, cache: str) -> dict:
-    if source.get("vision") or source.get("backend") == "hip":
-        raise ValueError("This c=4 candidate supports NVIDIA GPUs and text requests only")
+def configure(source: dict, engine: Path, context: int, reserve: int, cache: str,
+              kv: str = "int8", images: bool = False) -> dict:
+    if source.get("backend") == "hip":
+        raise ValueError("This c=4 candidate requires NVIDIA CUDA")
+    if kv not in ("fp16", "int8"):
+        raise ValueError("Concurrent KV must be fp16 or int8")
+    if images:
+        vision = source.get("vision")
+        if not isinstance(vision, dict) or not {"exe", "mmproj", "model"} <= vision.keys() or vision.get("gpu"):
+            raise ValueError("Concurrent images require a configured CPU vision encoder")
+    elif source.get("vision"):
+        raise ValueError("Use images=True to preserve a CPU vision encoder")
     gpu = source.get("gpu")
     if isinstance(gpu, list) and (len(gpu) < 2 or len(gpu) > 8 or
             any(type(i) is not int or i < 0 for i in gpu) or len(set(gpu)) != len(gpu)):
@@ -24,6 +33,7 @@ def configure(source: dict, engine: Path, context: int, reserve: int, cache: str
         values[key] = None if key in flags else next(args)
     incompatible = {"--vision", "--kv-resident", "--control-vector-scaled",
                     "--control-vector-layer-range", "--cvec-mode", "--cvec-dir"}
+    if images: incompatible.remove("--vision")
     present = incompatible & values.keys()
     if present:
         raise ValueError("Incompatible settings in source config: " + ", ".join(sorted(present)))
@@ -36,18 +46,19 @@ def configure(source: dict, engine: Path, context: int, reserve: int, cache: str
         raise ValueError("Expert cache must be 'auto' or a positive slot count")
     values.update({
         "--expert-cache": cache, "--prefill": "1024", "--spec": "4",
-        "--max-context": str(context), "--kv": "int8", "--vram-reserve-mib": str(reserve),
+        "--max-context": str(context), "--kv": kv, "--vram-reserve-mib": str(reserve),
         "--concurrency": "4", "--batch-rows": "16", "--batch-padding": "1",
         "--batch-parallel": "1", "--batch-graphs": "8",
         "--concurrent-prefill": "1024", "--pool-workers": "15",
         "--pcie-frac": "0", "--prompt-cache": "0",
     })
+    if images: values["--vision"] = None
     result = dict(source)
     result["exe"] = str(engine)
     result["args"] = [item for key, val in values.items()
                       for item in ([key] if val is None else [key, val])]
     result["model_name"] = source.get("model_name", "strata") + "-c4-candidate"
-    result["vision"] = None
+    result["vision"] = dict(source["vision"]) if images else None
     if isinstance(gpu, list):
         result["layer_split"] = source.get("layer_split") or "auto"
     result["env"] = dict(source.get("env", {}),
@@ -69,7 +80,10 @@ def main():
     parser.add_argument("--context", type=int, default=32768)
     parser.add_argument("--reserve-mib", type=int, default=2560)
     parser.add_argument("--expert-cache", default="auto")
+    parser.add_argument("--kv", choices=("fp16", "int8"), default="int8")
+    parser.add_argument("--images", action="store_true", help="preserve the source's CPU vision encoder")
     parser.add_argument("--gpus", help="use these NVIDIA GPUs together, e.g. 0,1")
+    parser.add_argument("--layer-split", help="layer boundaries, e.g. 24 for two 24-layer stages; explicit splits allocate only each stage's KV")
     args = parser.parse_args()
     if not args.exe.is_file(): parser.error(f"Candidate engine missing: {args.exe}")
     if not args.config.is_file(): parser.error(f"Installed model config missing: {args.config}")
@@ -81,7 +95,9 @@ def main():
         except ValueError:
             parser.error("--gpus must be comma-separated integer GPU indices")
         source["gpus_asked"] = True
-    result = configure(source, args.exe.resolve(), args.context, args.reserve_mib, args.expert_cache)
+    if args.layer_split:
+        source["layer_split"] = args.layer_split
+    result = configure(source, args.exe.resolve(), args.context, args.reserve_mib, args.expert_cache, args.kv, args.images)
     args.output.write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(f"Wrote {args.output}: {result['model_name']}")
     print("The first request will load the model; check the available RAM and VRAM before starting.")

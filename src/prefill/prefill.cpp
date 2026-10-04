@@ -1,3 +1,4 @@
+#include "strata/core/mrope_scope.hpp"
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/mtp.hpp"
@@ -932,6 +933,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     const core::OnDevice on_device(m.device);
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
+    const core::MropeScope mrope(ss.mrope);
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
     if (yield_requested || on_yield) {

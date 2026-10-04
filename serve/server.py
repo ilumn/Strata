@@ -276,8 +276,6 @@ class StrataEngine:
                     channel.put_nowait(None)
 
     def _generate_multiplex(self, ids, max_new, sampling, cancel, embeddings):
-        if embeddings:
-            raise ValueError("concurrent serving currently supports text only")
         self.last = {}
         self.progress = None
         channel = queue.Queue(maxsize=256)
@@ -288,7 +286,9 @@ class StrataEngine:
         done = False
         sent = False
         try:
-            self._send(f"CGEN {number} {int(max_new)}{self.sampling_keys(sampling or {})} "
+            command = "CGENI" if embeddings else "CGEN"
+            image_key = " image=" + str(embeddings).encode("utf-8").hex() if embeddings else ""
+            self._send(f"{command} {number} {int(max_new)}{self.sampling_keys(sampling or {})}{image_key} "
                        + ",".join(str(int(t)) for t in ids))
             sent = True
             heartbeat = time.monotonic()
@@ -505,6 +505,7 @@ class Vision:
     sends the same picture again (every turn, with most clients) encodes it once."""
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None):
+        self.gpu = bool(cfg.get("gpu"))
         args = [cfg["exe"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]]
         if cfg.get("gpu"):
             args.append("--gpu")
@@ -856,17 +857,15 @@ class Service:
         self.embeddings.path = None
         images = images_of(messages)
         if images:
-            if self.concurrency > 1:
-                raise ValueError("concurrent serving currently supports text only")
+            if self.concurrency > 1 and getattr(self.vision, "gpu", False):
+                raise ValueError("concurrent images require the CPU vision encoder")
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
             pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
             start = self.tok.encode(VISION_START, parse_special=True)[0]
-            # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
-            # run on the GPU at the same time - an encode during a running request left that request stuck at
-            # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
-            # same FIFO as the requests.
+            # The single-request GPU encoder shares generation's FIFO. Concurrent
+            # serving requires CPU encoding; its GPU decoders do not hold this FIFO.
             with self.fifo:
                 encoded = [self.vision.encode(src) for src in images]
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image

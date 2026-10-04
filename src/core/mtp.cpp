@@ -1,3 +1,4 @@
+#include "strata/core/mrope_scope.hpp"
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
 #include "strata/core/mtp.hpp"
 #include "strata/core/on_device.hpp"
@@ -359,6 +360,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
+    const MropeScope mrope(ss.mrope);
     // step_row0 >= 0: the full layer on step rows [step_row0, +T); step_row0 < 0: K/V only on rows [-1 - step_row0, +T)
     const bool full = step_row0 >= 0;
     const int row0 = full ? step_row0 : -1 - step_row0;

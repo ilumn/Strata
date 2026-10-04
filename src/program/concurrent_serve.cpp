@@ -1,4 +1,5 @@
 #include "strata/program/concurrent_serve.hpp"
+#include "strata/program/image_request.hpp"
 #include "strata/program/batch_schedule.hpp"
 #include "strata/program/prefill_yield.hpp"
 #include "strata/prefill/prefill.hpp"
@@ -50,6 +51,8 @@ struct Request {
     std::vector<int64_t> tokens;
     kernels::SamplerParams sampling{};
     float spec_min_p = 0.5f;
+    std::string embeddings_path;
+    ImagePrompt image;
 };
 bool parse_request(const std::string& line, const ConcurrentConfig& config, int64_t vocab, Request& r, std::string& err) {
     std::istringstream input(line);
@@ -66,7 +69,7 @@ bool parse_request(const std::string& line, const ConcurrentConfig& config, int6
         if (number < 1) throw std::invalid_argument("request id");
         r.id = (uint64_t) number;
         r.max_new = integer(maximum);
-        if (command != "CGEN" || r.max_new < 1 || r.max_new > config.context) throw std::invalid_argument("max_new");
+        if ((command != "CGEN" && command != "CGENI") || r.max_new < 1 || r.max_new > config.context) throw std::invalid_argument("max_new");
         r.sampling.greedy = true;
         r.sampling.temperature = 0;
         r.sampling.top_p = 1.0f;
@@ -90,6 +93,22 @@ bool parse_request(const std::string& line, const ConcurrentConfig& config, int6
             }
             if (got_tokens) throw std::invalid_argument("keys after tokens");
             const std::string key = token.substr(0, eq), value = token.substr(eq + 1);
+            if (key == "image") {
+                if (command != "CGENI" || !config.vision || !r.embeddings_path.empty() ||
+                    value.empty() || value.size() > 8192 || value.size() % 2) throw std::invalid_argument("image path");
+                auto hex = [](char c) -> int {
+                    if (c >= '0' && c <= '9') return c-'0';
+                    if (c >= 'a' && c <= 'f') return c-'a'+10;
+                    if (c >= 'A' && c <= 'F') return c-'A'+10;
+                    return -1;
+                };
+                for (size_t i = 0; i < value.size(); i += 2) {
+                    const int a = hex(value[i]), b = hex(value[i+1]);
+                    if (a < 0 || b < 0 || (a == 0 && b == 0)) throw std::invalid_argument("image path encoding");
+                    r.embeddings_path.push_back((char)(a*16+b));
+                }
+                continue;
+            }
             size_t used = 0;
             const float f = std::stof(value, &used);
             if (used != value.size() || !std::isfinite(f)) throw std::invalid_argument("sampling value");
@@ -107,6 +126,7 @@ bool parse_request(const std::string& line, const ConcurrentConfig& config, int6
             else throw std::invalid_argument("unsupported key: " + key);
         }
         if (!got_tokens || r.tokens.empty()) throw std::invalid_argument("empty prompt");
+        if (command == "CGENI" && r.embeddings_path.empty()) throw std::invalid_argument("missing image path");
         return true;
     } catch (const std::exception& e) { err = "bad concurrent request: " + std::string(e.what()); return false; }
 }
@@ -123,6 +143,7 @@ struct ConcurrentServe::Impl {
         void* arena = nullptr;
         float* handoff = nullptr; // portable mapped host allocation, owned by this stage
         void* ple_scratch = nullptr;
+        int32_t* mrope = nullptr;
         std::unique_ptr<core::Verifier> verify = std::make_unique<core::Verifier>();
         std::unique_ptr<prefill::Prefill> prompt = std::make_unique<prefill::Prefill>();
         ~Part() {
@@ -130,8 +151,10 @@ struct ConcurrentServe::Impl {
             prompt.reset(); verify.reset();
             if (handoff) cudaFreeHost(handoff);
             if (ple_scratch) cudaFree(ple_scratch);
+            if (mrope) cudaFree(mrope);
             if (arena) {
                 if (owned.qsa_states) for (int64_t i = 0; i < geometry->n_qsa_layers(); ++i) {
+                    if (!core::session_qsa_allocated(owned, i)) continue;
                     if (owned.qsa_states[i].host_step) cudaFreeHost(owned.qsa_states[i].host_step);
                     if (owned.qsa_states[i].host_pos) cudaFreeHost(owned.qsa_states[i].host_pos);
                 }
@@ -149,6 +172,7 @@ struct ConcurrentServe::Impl {
         core::MtpDrafter* draft = nullptr;
         int32_t* history_device = nullptr;
         std::vector<int32_t> history, consumed;
+        std::vector<const float*> image_rows;
         spec::SuffixDrafter suffix;
         spec::DraftPolicy policy{8};
         Request request;
@@ -223,8 +247,8 @@ bool ConcurrentServe::prepare(const core::ModelGeometry& g, core::SessionState& 
             if (i == 0) part.state = &first;
             else {
                 part.state = &part.owned;
-                if (!gpu_alloc(&part.arena, core::session_bytes(g, c.context, first.k), c.reserve_mib, err)) return false;
-                if (!core::session_init(g, c.context, first.k, part.arena, part.owned)) {
+                if (!gpu_alloc(&part.arena, core::session_bytes(g, c.context, first.k, first.layer_begin, first.layer_end), c.reserve_mib, err)) return false;
+                if (!core::session_init(g, c.context, first.k, part.arena, part.owned, first.layer_begin, first.layer_end)) {
                     err = "concurrency: session initialization failed"; return false;
                 }
                 part.owned.ple = first.ple;
@@ -235,6 +259,10 @@ bool ConcurrentServe::prepare(const core::ModelGeometry& g, core::SessionState& 
                     if (!gpu_alloc(&part.ple_scratch, (size_t)core::ple_run_scratch_bytes(), c.reserve_mib, err)) return false;
                     part.owned.ple.scratch = static_cast<float*>(part.ple_scratch);
                 }
+            }
+            if (c.vision) {
+                if (!gpu_alloc((void**)&part.mrope, (size_t)(c.context+64)*3*sizeof(int32_t), c.reserve_mib, err)) return false;
+                part.state->mrope = part.mrope;
             }
         }
         const core::OnDevice on_draft(m.stages.back()->device);
@@ -335,6 +363,10 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
         if (st.device != m.stages[i]->device || st.begin != next_layer || st.end <= st.begin ||
             st.end > g.n_layers || !st.weights || !st.cache || !st.hits.d_res || st.cache->slots() < 1) {
             err = "concurrency: invalid layer stage or expert cache"; return 1;
+        }
+        if (st.begin < m.stages[i]->primary->layer_begin ||
+            st.end > m.stages[i]->primary->layer_end) {
+            err = "concurrency: stage extends beyond its allocated sequence state"; return 1;
         }
         next_layer = st.end;
     }
@@ -532,9 +564,10 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
         return true;
     };
     std::fprintf(stderr, "strata concurrent: shared expert batching; independent MTP; adaptive cache %s; no conversation-prefix reuse\n", adaptive ? "on" : "off");
-    std::printf("INFO engine=" STRATA_VERSION " concurrency=%d batch_rows=%d batch_policy=%s context=%lld kv=int8 lookup=%d expert_policy=%s gpus=%zu\n",
-                c.requests, c.rows, c.depth ? "depth" : "fair", (long long)c.context, c.suffix,
-                adaptive ? "adaptive" : "static", stages.size());
+    std::printf("INFO engine=" STRATA_VERSION " concurrency=%d batch_rows=%d batch_policy=%s context=%lld kv=%s lookup=%d expert_policy=%s gpus=%zu mtp_kv=%s vision=%d\n",
+                c.requests, c.rows, c.depth ? "depth" : "fair", (long long)c.context, c.kv.c_str(), c.suffix,
+                adaptive ? "adaptive" : "static", stages.size(),
+                m.slots[0]->draft->kv_state().kv_int8 ? "int8" : "fp16", c.vision);
     std::printf("READY %lld stop multiplex\n", (long long) c.context);
     std::fflush(stdout);
     auto input = std::make_shared<Input>();
@@ -773,6 +806,12 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
         }
         return true;
     };
+    std::vector<int32_t> text_positions;
+    if (c.vision) {
+        text_positions.resize((size_t)(c.context+64)*3);
+        for (int64_t i = 0; i < c.context+64; ++i)
+            for (int j = 0; j < 3; ++j) text_positions[(size_t)i*3+j] = (int32_t)i;
+    }
     bool quitting = false;
     while (!quitting) {
         core::progress().busy.store(!live.empty());
@@ -798,6 +837,10 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
             Request request;
             std::string reason;
             if (!parse_request(line, c, wt.find("output.weight")->ne1, request, reason)) { error(request.id, reason); continue; }
+            if (!request.embeddings_path.empty() &&
+                !load_image_prompt(request.embeddings_path, request.tokens, g.n_embd, c.context, request.image, reason)) {
+                error(request.id, reason); continue;
+            }
             if (forced.count(request.id) && (size_t)request.max_new > forced.at(request.id).size()) {
                 error(request.id, "diagnostic continuation shorter than output cap"); continue;
             }
@@ -816,11 +859,27 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
             s.position = (int64_t) s.request.tokens.size() - 1;
             s.current = (int32_t) s.request.tokens.back();
             s.consumed.clear();
+            s.image_rows.clear();
+            if (!s.request.image.row_offsets.empty()) {
+                s.image_rows.resize(s.request.tokens.size(), nullptr);
+                for (size_t t = 0; t < s.image_rows.size(); ++t) {
+                    const int64_t off = s.request.image.row_offsets[t];
+                    if (off >= 0) s.image_rows[t] = s.request.image.values.data()+off;
+                }
+            }
+            s.prompt().embd_rows = s.image_rows.empty() ? nullptr : s.image_rows.data();
             std::fill(std::begin(s.probability), std::end(s.probability), 0.0f);
             s.suffix.reset(); s.policy = spec::DraftPolicy{c.window, 0.03, policy_costs};
             for (auto token : s.request.tokens) s.suffix.append((int32_t) token);
             for (size_t i = 0; i < stages.size(); ++i) {
                 const core::OnDevice on(stages[i].device);
+                if (c.vision) {
+                    const auto& positions = s.request.image.positions.empty() ? text_positions : s.request.image.positions;
+                    if (cudaMemcpy(s.parts[i]->mrope, positions.data(), positions.size()*sizeof(int32_t),
+                                   cudaMemcpyHostToDevice) != cudaSuccess) {
+                        err = "concurrency: image position upload failed"; return 1;
+                    }
+                }
                 core::session_zero(*s.parts[i]->state, g, nullptr, m.stages[i]->prompt_stream);
                 if (cudaStreamSynchronize(m.stages[i]->prompt_stream) != cudaSuccess) {
                     err = "concurrency: reset failed"; return 1;

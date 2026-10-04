@@ -50,13 +50,19 @@ static uint64_t ple_hist_bytes() {
     return (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * sizeof(float);
 }
 
-uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k) {
+uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t lb, int64_t le) {
+    if (le < 0) le = g.n_layers;
+    if (lb < 0 || le <= lb || le > g.n_layers) return 0;
+    int64_t nq = 0;
+    for (int64_t l = lb; l < le; ++l) if (is_qsa_layer(g, l)) ++nq;
+    // A stage without QSA still needs one metadata/RoPE proxy for shared buffers and MTP.
+    nq = std::max<int64_t>(1, nq);
     uint64_t n = 0;
     n += gdn_buffers_bytes(g);
     n += (uint64_t) g.n_gdn_layers() * gdn_state_floats(g) * 4;
     // One QSA state carries the RoPE table; the others borrow it (P7: 64 MiB per layer at 262K).
     if (g.n_qsa_layers() > 0)
-        n += qsa_state_bytes(g, max_cells, true) + (uint64_t) (g.n_qsa_layers() - 1) * qsa_state_bytes(g, max_cells, false);
+        n += qsa_state_bytes(g, max_cells, true) + (uint64_t)(nq - 1) * qsa_state_bytes(g, max_cells, false);
     n += qsa_buffers_bytes(g, max_cells);
     n += moe_buffers_bytes(g, k);
     n += block_buffers_bytes(g);
@@ -64,7 +70,18 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k) {
     return align_up(n, SESSION_STATE_ALIGN) + 4096;
 }
 
-uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s) {
+uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
+                      int64_t lb, int64_t le) {
+    if (le < 0) le = g.n_layers;
+    if (lb < 0 || le <= lb || le > g.n_layers || g.n_qsa_layers() < 1) return 0;
+    s.layer_begin = lb; s.layer_end = le;
+    s.qsa_allocated.assign((size_t)g.n_qsa_layers(), 0);
+    int64_t nq = 0, qi = 0;
+    for (int64_t l = 0; l < g.n_layers; ++l) if (is_qsa_layer(g, l)) {
+        if (l >= lb && l < le) { s.qsa_allocated[(size_t)qi] = 1; ++nq; }
+        ++qi;
+    }
+    if (nq == 0) { s.qsa_allocated[0] = 1; nq = 1; }
     uint8_t* p = (uint8_t*) base;
     uint64_t used = 0;
     auto take = [&](uint64_t bytes) {
@@ -83,17 +100,26 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     // pointers and `qsa_state_init` writes them - a contiguous array would need the arena to be laid out the
     // same way, which is a coupling with nothing to gain.
     const uint64_t first = qsa_state_bytes(g, max_cells, true), rest = qsa_state_bytes(g, max_cells, false);
-    s.qsa_state_arena = take(g.n_qsa_layers() > 0 ? first + (uint64_t) (g.n_qsa_layers() - 1) * rest : 0);
-    s.qsa_states = new QsaState[(size_t) g.n_qsa_layers()];
+    s.qsa_state_arena = take(first + (uint64_t)(nq - 1) * rest);
+    s.qsa_states = new QsaState[(size_t)g.n_qsa_layers()]{};
     s.qsa_buf_arena = take(qsa_buffers_bytes(g, max_cells));
 
     uint8_t* qp = (uint8_t*) s.qsa_state_arena;
     // a layer whose pinned RAM could not be had (KV streaming's host copy) is half-built: going on would have the
     // attention read null host pointers at the first request ("illegal memory access"), so the session fails here
+    int64_t owner = -1, allocated = 0;
+    for (int64_t i = 0; i < g.n_qsa_layers(); ++i) if (s.qsa_allocated[(size_t)i]) {
+        const uint64_t off = allocated ? first + (uint64_t)(allocated - 1) * rest : 0;
+        if (qsa_state_init(g, max_cells, qp + off, s.qsa_states[i],
+                           owner < 0 ? nullptr : &s.qsa_states[owner]) == 0) return 0;
+        if (owner < 0) owner = i;
+        ++allocated;
+    }
+    // Inactive entries provide format/context/RoPE metadata to existing workspace
+    // code. Only the marked entries are reset or freed; stage execution never uses
+    // an inactive layer's aliased KV pointers.
     for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
-        if (qsa_state_init(g, max_cells, qp + (i == 0 ? 0 : first + (uint64_t) (i - 1) * rest), s.qsa_states[i],
-                           i == 0 ? nullptr : &s.qsa_states[0]) == 0)
-            return 0;
+        if (!s.qsa_allocated[(size_t)i]) s.qsa_states[i] = s.qsa_states[owner];
     qsa_buffers_init(g, max_cells, s.qsa_buf_arena, s.qsa_bufs);
 
     s.moe_arena = take(moe_buffers_bytes(g, k));
@@ -121,7 +147,8 @@ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, 
     // every GDN layer's recurrence and conv history
     cudaMemsetAsync(s.gdn_state, 0, (size_t) g.n_gdn_layers() * gdn_state_floats(g) * 4, cs);
     // and every QSA layer's cache and indexer
-    for (int64_t i = 0; i < g.n_qsa_layers(); ++i) qsa_state_zero(s.qsa_states[i], g, stream);
+    for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
+        if (session_qsa_allocated(s, i)) qsa_state_zero(s.qsa_states[i], g, stream);
     // **AND THE PLE'S CONV HISTORY AND TOKEN WINDOW.**  A sequence that started with a warm history would
     // convolve over rows belonging to a different sequence - the conv reads NG_HIST previous NORMALIZED rows,
     // so a stale one is a real contribution and not a zero.  The token window resets to `NG_HIST`-many nulls
@@ -153,6 +180,7 @@ void stage_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionS
     sh.idx_n_head = g.idx_q_heads;
     sh.idx_dim = g.idx_key_dim;
     for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
+        if (!session_qsa_allocated(s, i)) continue;
         QsaState& q = s.qsa_states[i];
         qsa_step_fill(q.host_step, pos, sh);
         for (int64_t h = 0; h < g.n_head; ++h) q.host_pos[h] = (int32_t) (pos_base + pos);

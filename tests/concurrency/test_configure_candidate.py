@@ -29,6 +29,21 @@ class CandidateConfigTests(unittest.TestCase):
         self.assertEqual(args["--concurrency"], "4")
         self.assertEqual(args["--kv"], "int8")
 
+    def test_fp16_262k_images_preserve_cpu_encoder(self):
+        source = self.source([0, 1])
+        source["layer_split"] = "24"
+        source["vision"] = {"exe": "vision", "mmproj": "projector", "model": "model", "gpu": False}
+        result = mod.configure(source, Path("strata"), 262144, 2560, "auto", kv="fp16", images=True)
+        self.assertEqual(result["vision"], source["vision"])
+        self.assertIsNot(result["vision"], source["vision"])
+        self.assertEqual(result["layer_split"], "24")
+        self.assertIn("--vision", result["args"])
+        self.assertEqual(result["args"][result["args"].index("--kv")+1], "fp16")
+        self.assertEqual(result["args"][result["args"].index("--max-context")+1], "262144")
+        source["vision"]["gpu"] = True
+        with self.assertRaises(ValueError):
+            mod.configure(source, Path("strata"), 262144, 2560, "auto", kv="fp16", images=True)
+
     def test_single_gpu_remains_single(self):
         result = mod.configure(self.source(1), Path("strata"), 32768, 2560, "auto")
         self.assertEqual(result["gpu"], 1)

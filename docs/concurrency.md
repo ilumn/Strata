@@ -34,7 +34,7 @@ MTP stays enabled and keeps the normal confidence threshold. Each request drafts
 - One model/expert arena and shared immutable MTP weights. Each request has separate attention, recurrence, PLE history, draft KV, sampling and rollback state.
 - Adaptive expert-cache updates at completed scheduling boundaries.
 
-Concurrent mode supports CUDA layer splitting over distinct GPUs. It rejects vision, ROCm, streamed KV, control vectors, helper expert caches and split-window verification. It does not reuse conversation-prefix checkpoints. The original single-request path remains available with `--concurrency 1`.
+Concurrent mode supports CUDA layer splitting over distinct GPUs, resident FP16 or INT8 KV, and images through a CPU vision encoder. It rejects GPU vision encoding, ROCm, streamed KV, control vectors, helper expert caches and split-window verification. It does not reuse conversation-prefix checkpoints. The original single-request path remains available with `--concurrency 1`.
 
 ## What is batched
 

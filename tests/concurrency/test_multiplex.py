@@ -99,6 +99,30 @@ class MultiplexTests(unittest.TestCase):
     def emit(self, text):
         self.engine.proc.stdout.queue.put(text + "\n")
 
+    def test_image_command_and_text_command_are_isolated(self):
+        result, errors = {}, []
+        def consume(index, embeddings):
+            try:
+                result[index] = list(self.engine.generate([10, 11], 2, {}, threading.Event(), embeddings=embeddings))
+            except Exception as exc:
+                errors.append(exc)
+        image_path = Path("/tmp/image with spaces.sve")
+        image = threading.Thread(target=consume, args=(1, image_path))
+        text = threading.Thread(target=consume, args=(2, None))
+        image.start(); wait_for(lambda: len(self.engine._channels) == 1)
+        text.start(); wait_for(lambda: len(self.engine._channels) == 2)
+        commands = self.engine.proc.stdin.getvalue().splitlines()
+        self.assertTrue(commands[0].startswith("CGENI 1 2"), commands)
+        self.assertIn("image=" + str(image_path).encode("utf-8").hex(), commands[0])
+        self.assertTrue(commands[1].startswith("CGEN 2 2"), commands)
+        for number, token in ((2, 22), (1, 11)):
+            self.emit(f"R {number} T {token}")
+            self.emit(f"R {number} DONE 1 2 1.0 2.0 stop 0 0 0")
+        image.join(2); text.join(2)
+        self.assertFalse(image.is_alive() or text.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result, {1: [11], 2: [22]})
+
     def test_four_streams_and_timings_are_isolated(self):
         result, errors = {}, []
         def consume(index):

@@ -29,6 +29,9 @@ namespace strata::core {
 /// handoff between the GPU and the CPU expert pool.
 struct SessionState {
     int64_t max_cells = 0;
+    int64_t layer_begin = 0, layer_end = -1;
+    std::vector<uint8_t> qsa_allocated; // only these entries own KV/pinned allocations
+    const int32_t* mrope = nullptr;    // fixed-address, request-local multimodal positions
 
     GdnBuffers gdn;                 ///< the 36 GDN layers share one set of scratch; their STATE is per layer
     float* gdn_state = nullptr;     ///< (n_gdn_layers, gdn_state_floats)
@@ -76,9 +79,14 @@ struct SessionState {
 /// Bytes for a whole session at `max_cells` of context.  Every layer's state is sized at once, because P2.T10
 /// requires ZERO token-path allocations - a `cudaMalloc` that happened on the first token of a longer sequence
 /// would satisfy every test here and fail that one.
-uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k);
+uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k,
+                       int64_t layer_begin = 0, int64_t layer_end = -1);
 /// Carves `base` (DEVICE memory) into `s`.  Returns the bytes used.
-uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s);
+uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
+                      int64_t layer_begin = 0, int64_t layer_end = -1);
+inline bool session_qsa_allocated(const SessionState& s, int64_t i) {
+    return s.qsa_allocated.empty() || s.qsa_allocated[(size_t)i] != 0;
+}
 /// Zeroes every layer's state - the residual to `R_init`, everything else to zero, so a fresh sequence starts
 /// from the reference's own `zeros()`.
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream);
