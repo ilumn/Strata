@@ -1,6 +1,6 @@
 # Experimental concurrent serving
 
-This branch adds configurable shared-model serving for **1–4 requests**. It is based on upstream 0.1.27, commit `a79080535d1b2a71a3419a0d97d8e7dca194b0f1`. Native Windows qualification on an RTX 5090 established exact token parity at c=1, 2, 3 and 4 under the matched numerical settings below. This remains a single-GPU experimental implementation; the qualification is specific to Swift IQ2_XS and the tested configuration, not a guarantee across all models and settings.
+This branch adds configurable shared-model serving for **1–4 requests**. It is based on upstream 0.1.27, commit `a79080535d1b2a71a3419a0d97d8e7dca194b0f1`. Native Windows qualification on an RTX 5090 established exact token parity at c=1, 2, 3 and 4 under the matched numerical settings below. Those historical measurements qualify one GPU with Swift IQ2_XS and the tested configuration. This local extension adds CUDA layer splitting with concurrent requests; see [multi-GPU operation](concurrency-multigpu.md) for its separate qualification and limitations.
 
 The subsequent throughput work adds up to sixteen shared expert rows, optional padded verification and parallel request projections. See [the throughput study](concurrency-throughput.md) for matched measurements, current qualification and recommended settings. The qualification tables later in this document describe the original implementation.
 
@@ -34,7 +34,7 @@ MTP stays enabled and keeps the normal confidence threshold. Each request drafts
 - One model/expert arena and shared immutable MTP weights. Each request has separate attention, recurrence, PLE history, draft KV, sampling and rollback state.
 - Adaptive expert-cache updates at completed scheduling boundaries.
 
-Concurrent mode rejects vision, ROCm, multi-GPU, streamed KV, control vectors and split-window verification. It does not reuse conversation-prefix checkpoints. The original single-request path remains available with `--concurrency 1`.
+Concurrent mode supports CUDA layer splitting over distinct GPUs. It rejects vision, ROCm, streamed KV, control vectors, helper expert caches and split-window verification. It does not reuse conversation-prefix checkpoints. The original single-request path remains available with `--concurrency 1`.
 
 ## What is batched
 

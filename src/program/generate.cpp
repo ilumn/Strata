@@ -1121,10 +1121,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata: concurrent serving currently requires NVIDIA CUDA\n"); return 2;
 #endif
         if (!o.serve || o.native_preset.empty() || o.mtp.empty() || o.spec < 2 || o.spec > 8 || o.kv != "int8" ||
-            o.vision || !o.layer_split.empty() || !o.split_device.empty() || o.spec_split ||
+            o.vision || o.spec_split ||
             !o.cvec_files.empty() || o.kv_resident || o.expert_cache_remote[0] || o.expert_cache_remote[1] ||
             o.expert_cache_remote[2] || o.expert_profile.empty() || o.expert_cache == 0 || o.no_pool || o.no_capture) {
-            std::fprintf(stderr, "strata: concurrency requires --serve, native experts, MTP/spec, int8 resident KV and a profile-filled cache; vision, control vectors, split verify, KV streaming and multi-GPU are not supported\n");
+            std::fprintf(stderr, "strata: concurrency requires --serve, native experts, MTP/spec, int8 resident KV and a profile-filled cache; vision, control vectors, split verify, KV streaming and helper expert caches are not supported\n");
             return 2;
         }
     }
@@ -1781,7 +1781,13 @@ int main(int argc, char** argv) {
         config.suffix = o.suffix_draft; config.eos = o.eos_ids;
         config.adapt_every = o.adapt_every; config.adapt_swaps = o.adapt_swaps;
         concurrent = std::make_unique<strata::program::ConcurrentServe>(config);
-        if (!concurrent->prepare(g, ss, mtp, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        if (split_same) {
+            std::fprintf(stderr, "strata: concurrent layer stages require distinct CUDA devices\n"); return 2;
+        }
+        std::vector<strata::program::ConcurrentStage> parts;
+        parts.push_back({0, 0, -1, &ss});
+        for (auto& st : stages) parts.push_back({st->dev, 0, -1, &st->ss});
+        if (!concurrent->prepare(g, ss, mtp, err, parts)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
     }
     // Create the additional contexts after MTP has secured CUDA0 memory, but
     // before the host arena maps its expert pages into their address spaces.
@@ -1908,7 +1914,9 @@ int main(int argc, char** argv) {
         if (const cudaError_t e = cudaMemGetInfo(&fb, &tb); e != cudaSuccess)
             std::fprintf(stderr, "strata generate: layer split: CUDA%d free memory: %s\n", dev < 0 ? 0 : dev,
                          cudaGetErrorString(e));
-        const int64_t reserve = ((int64_t) o.vram_reserve_mib + split_pf_mib + (later ? 1024 : 0)) << 20;
+        const int64_t window_mib = concurrent ? 512 + (int64_t)o.concurrency * 256 +
+            (int64_t)o.batch_rows * 8 + (int64_t)o.batch_graphs * 16 : (later ? 1024 : 0);
+        const int64_t reserve = ((int64_t)o.vram_reserve_mib + split_pf_mib + window_mib) << 20;
         return std::max<int64_t>((int64_t) fb - reserve, 0);
     };
     if (multi_gpu && split_auto) {
@@ -3102,8 +3110,16 @@ int main(int argc, char** argv) {
         strata::core::VerifyHits hits;
         hits.d_res = d_res; hits.cache_base = drive.d.cache_base; hits.blob = drive.d.cache_blob;
         hits.slot_off = xcache.slot_offsets(); hits.n_slots = xcache.slots();
+        std::vector<strata::program::ConcurrentStage> parts;
+        parts.push_back({0, 0, multi_gpu ? split_at[0] : g.n_layers, &ss, &wt, &native_head, &xcache, hits});
+        for (auto& st : stages) {
+            strata::core::VerifyHits resident;
+            resident.d_res = st->d_res; resident.cache_base = st->cache.device_slot(0);
+            resident.blob = hits.blob; resident.slot_off = st->cache.slot_offsets(); resident.n_slots = st->cache.slots();
+            parts.push_back({st->dev, st->lb, st->le, &st->ss, &st->wt, &st->head, &st->cache, resident});
+        }
         const int result = concurrent->run(wt, &native_head, srcp, xcache, host_res.data(), hits,
-                                           drive.d, &drive_pool_multi, &drive, err);
+                                           drive.d, &drive_pool_multi, &drive, err, parts);
         if (result) std::fprintf(stderr, "strata concurrent serve: %s\n", err.c_str());
         return result;
     }

@@ -115,6 +115,7 @@ void Verifier::diag(std::FILE* f) const {
 }
 
 Verifier::~Verifier() {
+    const OnDevice on_device(device_);
     const Verifier* self = this;
     g_diag_verifier.compare_exchange_strong(self, nullptr);
     if (cs_) cudaStreamSynchronize(cs_);
@@ -766,7 +767,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
             if (!post(l, grp)) return false;
             if (l + 1 < le_ && !pre(l + 1, grp)) return false;
         }
-    if (le_ < g.n_layers) {   // a layer split's earlier stage: hand the residual on, no head
+    }
+    if (le_ < g.n_layers) {   // also used by phase 4 of the batched stage graph
         for (int t = 0; t < T; ++t) {
             copy_from_mapped(hand_out_ + (size_t) t * HB, Rt(t), HC * N, cs);
             copy_from_mapped(hand_out_ + (size_t) t * HB + HC * N, bo_ + (size_t) t * N, N, cs);
@@ -775,7 +777,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err, int phase
         return true;
     }
 
-    }
     // ---- the head, T columns, and the argmax of each
     stamp(g.n_layers, 0, 0);
     {
@@ -1154,15 +1155,15 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
 bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool, void* user, std::string& err) {
     using namespace strata::kernels;
     const OnDevice on_device(device_);
-    if (batch.empty() || batch.size() > 4 || split_ || next_ || lb_ != 0 || le_ != g_->n_layers) {
-        err = "batch verify: requires 1..4 complete single-GPU windows"; return false;
+    if (batch.empty() || batch.size() > 4 || split_ || next_) {
+        err = "batch verify: requires 1..4 windows on one layer stage"; return false;
     }
     int total = 0;
     std::vector<std::pair<Verifier*, int>> shape;
     for (const auto& b : batch) {
         Verifier* v = b.verifier;
-        if (!v || v == this || v->g_ != g_ || v->wt_ != wt_ || v->device_ != device_ || v->split_ || v->next_ ||
-            v->lb_ != 0 || v->le_ != g_->n_layers || b.count < 1 || b.count > v->max_t_ ||
+        if (!v || v == this || v->g_ != g_ || v->wt_ != wt_ || v->device_ != device_ || v->split_ ||
+            v->lb_ != lb_ || v->le_ != le_ || b.count < 1 || b.count > v->max_t_ ||
             !b.tokens || !b.output) {
             err = "batch verify: incompatible member"; return false;
         }
@@ -1196,7 +1197,7 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
             copy_i32_from_mapped((int32_t*) dst, (const int32_t*) src, (int64_t) (bytes / 4), stream);
         };
         for (const auto& b : batch) if (ok) ok = b.verifier->record_window(b.count, cs_, err, 0);
-        for (int64_t l = 0; ok && l < g_->n_layers; ++l) {
+        for (int64_t l = lb_; ok && l < le_; ++l) {
             if (prof_on_) gpu_stamp(prof_, (int) (l * kProfPer + 27), cs_);
             if (batch_parallel_ && cudaEventRecord(batch_fork_, cs_) != cudaSuccess) {
                 err = "batch verify: fork failed"; ok = false; break;
@@ -1288,13 +1289,13 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
     if (!ran) return false;
     if (prof_on_) {
         cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
-        for (int64_t l = 0; l < g_->n_layers; ++l)
+        for (int64_t l = lb_; l < le_; ++l)
             for (int stage = 0; stage < 3; ++stage)
                 batch_gpu_ms[stage] += (double) (prof_h_[(size_t) l * kProfPer + 28 + stage] -
                                                  prof_h_[(size_t) l * kProfPer + 27 + stage]) / 1e6;
         constexpr int expert_begin[6] = {28, 19, 20, 21, 22, 23};
         constexpr int expert_end[6] = {19, 20, 21, 22, 23, 29};
-        for (int64_t l = 0; l < g_->n_layers; ++l)
+        for (int64_t l = lb_; l < le_; ++l)
             for (int stage = 0; stage < 6; ++stage)
                 batch_expert_ms[stage] += (double) (prof_h_[(size_t) l * kProfPer + expert_end[stage]] -
                                                     prof_h_[(size_t) l * kProfPer + expert_begin[stage]]) / 1e6;
@@ -1305,7 +1306,7 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
         auto& member = *batch.front().verifier;
         if (member.prof_on_) {
             cudaMemcpy(member.prof_h_.data(), member.prof_, member.prof_h_.size() * 8, cudaMemcpyDeviceToHost);
-            for (int64_t l = 0; l < g_->n_layers; ++l) {
+            for (int64_t l = lb_; l < le_; ++l) {
                 const int kind = is_qsa_layer(*g_, l) ? 1 : 0;
                 const auto* stamps = member.prof_h_.data() + l * kProfPer;
                 const int gdn[] = {1, 2, 3, 4, 5, 6, 16, 17, 18};
@@ -1321,6 +1322,10 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
                 }
             }
         }
+    }
+    if (le_ < g_->n_layers) {
+        for (const auto& b : batch) ++b.verifier->windows;
+        return true; // the hand-offs are synchronized; the final stage owns sampling
     }
     for (const auto& b : batch) {
         Verifier& v = *b.verifier;
@@ -1391,6 +1396,17 @@ void Verifier::publish_plan(void* ctx) {
     Verifier* v = (Verifier*) ctx;
     _mm_sfence();
     *(volatile uint32_t*) v->h_flagA_ = v->cur_layer_ + 1;
+}
+
+bool Verifier::diagnostic_logits(std::vector<float>& values, std::string& err) const {
+    if (next_) return next_->diagnostic_logits(values, err);
+    const OnDevice on_device(device_);
+    if (!head_logits_ || n_vocab_ <= 0) { err = "diagnostic: missing logits"; return false; }
+    values.resize((size_t)n_vocab_);
+    if (cudaMemcpy(values.data(), head_logits_, values.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        err = "diagnostic: logits copy failed"; return false;
+    }
+    return true;
 }
 
 bool Verifier::commit(int n_keep, std::string& err) {

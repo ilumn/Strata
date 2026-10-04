@@ -125,14 +125,7 @@ public:
     bool commit(int n_keep, std::string& err);
 
     // Diagnostic only, after a completed run/run_batch; never called in timing runs.
-    bool diagnostic_logits(std::vector<float>& values, std::string& err) const {
-        if (!head_logits_ || n_vocab_ <= 0) { err = "diagnostic: missing logits"; return false; }
-        values.resize((size_t) n_vocab_);
-        if (cudaMemcpy(values.data(), head_logits_, values.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
-            err = "diagnostic: logits copy failed"; return false;
-        }
-        return true;
-    }
+    bool diagnostic_logits(std::vector<float>& values, std::string& err) const;
 
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;

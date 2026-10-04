@@ -9,8 +9,12 @@ from pathlib import Path
 
 
 def configure(source: dict, engine: Path, context: int, reserve: int, cache: str) -> dict:
-    if source.get("vision") or source.get("backend") == "hip" or isinstance(source.get("gpu"), list):
-        raise ValueError("This c=4 candidate supports one NVIDIA GPU and text requests only")
+    if source.get("vision") or source.get("backend") == "hip":
+        raise ValueError("This c=4 candidate supports NVIDIA GPUs and text requests only")
+    gpu = source.get("gpu")
+    if isinstance(gpu, list) and (len(gpu) < 2 or len(gpu) > 8 or
+            any(type(i) is not int or i < 0 for i in gpu) or len(set(gpu)) != len(gpu)):
+        raise ValueError("GPU stages require 2..8 distinct nonnegative NVIDIA GPU indices")
     values = {}
     args = iter(source["args"])
     flags = {"--vision", "--no-prefill-borrow"}
@@ -44,6 +48,8 @@ def configure(source: dict, engine: Path, context: int, reserve: int, cache: str
                       for item in ([key] if val is None else [key, val])]
     result["model_name"] = source.get("model_name", "strata") + "-c4-candidate"
     result["vision"] = None
+    if isinstance(gpu, list):
+        result["layer_split"] = source.get("layer_split") or "auto"
     result["env"] = dict(source.get("env", {}),
                          STRATA_BATCH_DRAFT="1",
                          STRATA_DETERMINISTIC_DRAFT_POLICY="0",
@@ -63,11 +69,18 @@ def main():
     parser.add_argument("--context", type=int, default=32768)
     parser.add_argument("--reserve-mib", type=int, default=2560)
     parser.add_argument("--expert-cache", default="auto")
+    parser.add_argument("--gpus", help="use these NVIDIA GPUs together, e.g. 0,1")
     args = parser.parse_args()
     if not args.exe.is_file(): parser.error(f"Candidate engine missing: {args.exe}")
     if not args.config.is_file(): parser.error(f"Installed model config missing: {args.config}")
     if args.output.exists(): parser.error(f"Output already exists: {args.output}")
     source = json.loads(args.config.read_text(encoding="utf-8-sig"))
+    if args.gpus:
+        try:
+            source["gpu"] = [int(i) for i in args.gpus.split(",")]
+        except ValueError:
+            parser.error("--gpus must be comma-separated integer GPU indices")
+        source["gpus_asked"] = True
     result = configure(source, args.exe.resolve(), args.context, args.reserve_mib, args.expert_cache)
     args.output.write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(f"Wrote {args.output}: {result['model_name']}")

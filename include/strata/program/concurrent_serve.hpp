@@ -6,6 +6,17 @@
 #include <memory>
 
 namespace strata::program {
+// One layer range on one device. The model and expert arena are shared across
+// requests; each request owns a session, verifier and hand-off for every range.
+struct ConcurrentStage {
+    int device = 0;
+    int64_t begin = 0, end = -1;
+    core::SessionState* session = nullptr;
+    const core::WeightTable* weights = nullptr;
+    const core::NativeHead* head = nullptr;
+    core::ExpertCache* cache = nullptr;
+    core::VerifyHits hits;
+};
 struct ConcurrentConfig {
     int requests = 1, rows = 8, window = 4, mtp_window_rows = 4, prefill_chunk = 256;
     int graph_cache = 8;
@@ -24,10 +35,11 @@ public:
     explicit ConcurrentServe(ConcurrentConfig config);
     ~ConcurrentServe();
     // Allocate sequence states and the shared prompt workspace BEFORE sizing the expert cache.
-    bool prepare(const core::ModelGeometry&, core::SessionState&, core::MtpDrafter&, std::string&);
+    bool prepare(const core::ModelGeometry&, core::SessionState&, core::MtpDrafter&, std::string&,
+                 const std::vector<ConcurrentStage>& stages = {});
     int run(const core::WeightTable&, const core::NativeHead*, core::ExpertSource*, core::ExpertCache&,
             int32_t* host_res, const core::VerifyHits&, core::ExpertDispatch&,
-            core::PoolMultiFn, void* user, std::string&);
+            core::PoolMultiFn, void* user, std::string&, const std::vector<ConcurrentStage>& stages = {});
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

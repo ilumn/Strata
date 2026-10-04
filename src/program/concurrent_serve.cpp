@@ -5,6 +5,7 @@
 #include "strata/core/native_head.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/layer.hpp"
+#include "strata/core/on_device.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -114,14 +115,38 @@ void error(uint64_t id, const std::string& e) { std::printf("R %llu ERR %s\n", (
 
 struct ConcurrentServe::Impl {
     explicit Impl(ConcurrentConfig c) : config(std::move(c)) {}
-    struct Slot {
+    struct Part {
+        int device = 0;
+        const core::ModelGeometry* geometry = nullptr;
         core::SessionState owned;
         core::SessionState* state = nullptr;
         void* arena = nullptr;
+        float* handoff = nullptr; // portable mapped host allocation, owned by this stage
+        void* ple_scratch = nullptr;
+        std::unique_ptr<core::Verifier> verify = std::make_unique<core::Verifier>();
+        std::unique_ptr<prefill::Prefill> prompt = std::make_unique<prefill::Prefill>();
+        ~Part() {
+            const core::OnDevice on(device);
+            prompt.reset(); verify.reset();
+            if (handoff) cudaFreeHost(handoff);
+            if (ple_scratch) cudaFree(ple_scratch);
+            if (arena) {
+                if (owned.qsa_states) for (int64_t i = 0; i < geometry->n_qsa_layers(); ++i) {
+                    if (owned.qsa_states[i].host_step) cudaFreeHost(owned.qsa_states[i].host_step);
+                    if (owned.qsa_states[i].host_pos) cudaFreeHost(owned.qsa_states[i].host_pos);
+                }
+                delete[] owned.qsa_states;
+                cudaFree(arena);
+            }
+        }
+    };
+    struct Slot {
+        std::vector<std::unique_ptr<Part>> parts;
+        core::SessionState* state() { return parts.front()->state; }
+        core::Verifier& verify() { return *parts.front()->verify; }
+        prefill::Prefill& prompt() { return *parts.front()->prompt; }
         std::unique_ptr<core::MtpDrafter> draft_owner;
         core::MtpDrafter* draft = nullptr;
-        core::Verifier verify;
-        prefill::Prefill prompt;
         int32_t* history_device = nullptr;
         std::vector<int32_t> history, consumed;
         spec::SuffixDrafter suffix;
@@ -135,76 +160,108 @@ struct ConcurrentServe::Impl {
         float probability[8]{};
         double prompt_ms = 0;
         Clock::time_point decode_start{};
-        void* ple_scratch = nullptr;
-        ~Slot() { if (history_device) cudaFree(history_device); if (ple_scratch) cudaFree(ple_scratch); }
+        ~Slot() {
+            const core::OnDevice on(parts.empty() ? -1 : parts.back()->device);
+            draft_owner.reset();
+            if (history_device) cudaFree(history_device);
+            parts.clear();
+        }
     };
     ConcurrentConfig config;
     const core::ModelGeometry* geometry = nullptr;
     std::vector<std::unique_ptr<Slot>> slots;
-    void* prompt_workspace = nullptr;
-    uint64_t prompt_bytes = 0;
-    cudaStream_t prompt_stream = nullptr;
-    ~Impl() {
-        // Graphs and draft state must die before the sessions they reference. The primary session is borrowed.
-        std::vector<std::pair<void*, core::QsaState*>> allocations;
-        for (const auto& s : slots) if (s->arena) allocations.emplace_back(s->arena, s->owned.qsa_states);
-        slots.clear();
-        for (const auto& a : allocations) {
-            if (a.second) for (int64_t i = 0; i < geometry->n_qsa_layers(); ++i) {
-                if (a.second[i].host_step) cudaFreeHost(a.second[i].host_step);
-                if (a.second[i].host_pos) cudaFreeHost(a.second[i].host_pos);
-            }
-            delete[] a.second;
-            cudaFree(a.first);
+    struct StageStorage {
+        int device = 0;
+        core::SessionState* primary = nullptr;
+        void* prompt_workspace = nullptr;
+        uint64_t prompt_bytes = 0;
+        cudaStream_t prompt_stream = nullptr;
+        ~StageStorage() {
+            const core::OnDevice on(device);
+            if (prompt_stream) cudaStreamDestroy(prompt_stream);
+            if (prompt_workspace) cudaFree(prompt_workspace);
         }
-        if (prompt_stream) cudaStreamDestroy(prompt_stream);
-        if (prompt_workspace) cudaFree(prompt_workspace);
-    }
+    };
+    std::vector<std::unique_ptr<StageStorage>> stages;
+    ~Impl() { slots.clear(); stages.clear(); }
+
 };
 ConcurrentServe::ConcurrentServe(ConcurrentConfig c) : impl_(std::make_unique<Impl>(std::move(c))) {}
 ConcurrentServe::~ConcurrentServe() = default;
 
 bool ConcurrentServe::prepare(const core::ModelGeometry& g, core::SessionState& primary, core::MtpDrafter& draft,
-                              std::string& err) {
+                              std::string& err, const std::vector<ConcurrentStage>& stage_config) {
     auto& m = *impl_;
     m.geometry = &g;
     const auto& c = m.config;
+    auto inputs = stage_config;
+    if (inputs.empty()) {
+        ConcurrentStage first;
+        cudaGetDevice(&first.device); first.session = &primary;
+        inputs.push_back(first);
+    }
+    std::unordered_set<int> devices;
+    for (const auto& input : inputs) {
+        if (!input.session || !devices.insert(input.device).second) {
+            err = "concurrency: stages require distinct devices and valid sessions"; return false;
+        }
+        m.stages.push_back(std::make_unique<Impl::StageStorage>());
+        auto& stage = *m.stages.back();
+        stage.device = input.device; stage.primary = input.session;
+    }
     static const core::ModelGeometry draft_geometry{};
     for (int i = 0; i < c.requests; ++i) {
-        // Register ownership before any allocation that can fail partway through initialization.
         m.slots.push_back(std::make_unique<Impl::Slot>());
-        auto& s = m.slots.back();
-        s->suffix = spec::SuffixDrafter(std::max(1, c.suffix), 64, (size_t) c.context + 4096);
-        if (i == 0) { s->state = &primary; s->draft = &draft; }
-        else {
-            if (!gpu_alloc(&s->arena, core::session_bytes(g, c.context, primary.k), c.reserve_mib, err)) return false;
-            s->state = &s->owned;
-            if (!core::session_init(g, c.context, primary.k, s->arena, s->owned)) { err = "concurrency: session initialization failed"; return false; }
-            s->owned.ple = primary.ple;
-            s->owned.ple.hist = s->owned.ple_hist;
-            s->owned.ple.prev = s->owned.ple_prev;
-            s->owned.ple.token = &s->owned.ple_token;
-            // PLE weights/table are immutable, but its scratch is written during layer 1.
-            // Parallel member streams must not inherit the primary session's scratch pointer.
-            if (c.parallel_batch && primary.ple.ready()) {
-                if (!gpu_alloc(&s->ple_scratch, (size_t) core::ple_run_scratch_bytes(), c.reserve_mib, err)) return false;
-                s->owned.ple.scratch = static_cast<float*>(s->ple_scratch);
+        auto& slot = *m.slots.back();
+        slot.suffix = spec::SuffixDrafter(std::max(1, c.suffix), 64, (size_t)c.context + 4096);
+        for (const auto& stage : m.stages) {
+            const core::OnDevice on(stage->device);
+            slot.parts.push_back(std::make_unique<Impl::Part>());
+            auto& part = *slot.parts.back();
+            part.device = stage->device; part.geometry = &g;
+            auto& first = *stage->primary;
+            if (i == 0) part.state = &first;
+            else {
+                part.state = &part.owned;
+                if (!gpu_alloc(&part.arena, core::session_bytes(g, c.context, first.k), c.reserve_mib, err)) return false;
+                if (!core::session_init(g, c.context, first.k, part.arena, part.owned)) {
+                    err = "concurrency: session initialization failed"; return false;
+                }
+                part.owned.ple = first.ple;
+                part.owned.ple.hist = part.owned.ple_hist;
+                part.owned.ple.prev = part.owned.ple_prev;
+                part.owned.ple.token = &part.owned.ple_token;
+                if (c.parallel_batch && first.ple.ready()) {
+                    if (!gpu_alloc(&part.ple_scratch, (size_t)core::ple_run_scratch_bytes(), c.reserve_mib, err)) return false;
+                    part.owned.ple.scratch = static_cast<float*>(part.ple_scratch);
+                }
             }
-            s->draft_owner = std::make_unique<core::MtpDrafter>();
-            s->draft = s->draft_owner.get();
-            if (!s->draft->load(c.mtp_dir, draft_geometry, s->owned, c.window, err, c.draft_context, &draft)) return false;
         }
-        s->draft->set_max_drafts(c.mtp_window_rows - 1);
+        const core::OnDevice on_draft(m.stages.back()->device);
+        if (i == 0) slot.draft = &draft;
+        else {
+            slot.draft_owner = std::make_unique<core::MtpDrafter>();
+            slot.draft = slot.draft_owner.get();
+            if (!slot.draft->load(c.mtp_dir, draft_geometry, *slot.parts.back()->state,
+                                  c.window, err, c.draft_context, &draft)) return false;
+        }
+        slot.draft->set_max_drafts(c.mtp_window_rows - 1);
     }
-    m.prompt_bytes = prefill::Prefill::bytes_needed(g, primary, c.prefill_chunk);
-    if (!gpu_alloc(&m.prompt_workspace, (size_t) m.prompt_bytes, c.reserve_mib, err)) return false;
-    if (cudaStreamCreateWithFlags(&m.prompt_stream, cudaStreamNonBlocking) != cudaSuccess) { err = "concurrency: prompt stream failed"; return false; }
+    for (auto& stage : m.stages) {
+        const core::OnDevice on(stage->device);
+        stage->prompt_bytes = prefill::Prefill::bytes_needed(g, *stage->primary, c.prefill_chunk);
+        if (!gpu_alloc(&stage->prompt_workspace, (size_t)stage->prompt_bytes, c.reserve_mib, err)) return false;
+        if (cudaStreamCreateWithFlags(&stage->prompt_stream, cudaStreamNonBlocking) != cudaSuccess) {
+            err = "concurrency: prompt stream failed"; return false;
+        }
+    }
     return true;
 }
 
 int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* head, core::ExpertSource* source,
                          core::ExpertCache& cache, int32_t* host_res, const core::VerifyHits& hits,
-                         core::ExpertDispatch& dispatch, core::PoolMultiFn pool, void* user, std::string& err) {
+                         core::ExpertDispatch& dispatch, core::PoolMultiFn pool, void* user, std::string& err,
+                         const std::vector<ConcurrentStage>& stage_config) {
     auto& m = *impl_;
     const auto& c = m.config;
     const auto& g = *m.geometry;
@@ -232,7 +289,10 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
         if (!numerical_trace) { err = "diagnostic: cannot open logits output"; return 1; }
         std::fprintf(stderr, "strata diagnostic: teacher forcing active; timings NOT performance evidence\n");
     }
-    if (!head || !head->loaded() || !wt.find("output.weight")) { err = "concurrency: native head required"; return 1; }
+    if ((!stage_config.empty() && (!stage_config.back().head || !stage_config.back().head->loaded())) ||
+        (stage_config.empty() && (!head || !head->loaded())) || !wt.find("output.weight")) {
+        err = "concurrency: native head required on final stage"; return 1;
+    }
     if (!source || !host_res || !hits.d_res || cache.slots() < 1) {
         err = "concurrency: no profile-filled expert cache fits; reduce context/concurrency or increase available VRAM";
         return 1;
@@ -265,32 +325,106 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
     }
     struct ProgressGuard { ~ProgressGuard() { core::progress().busy.store(false); } } progress_guard;
     std::jthread watchdog; // outlives the batch graph, including teardown after a failed GPU execution
-    core::Verifier batch;
-    batch.set_batch_cache(c.graph_cache, c.reserve_mib);
-    batch.set_batch_parallel(c.parallel_batch);
-    if (!batch.init(wt, g, *m.slots[0]->state, hits, head, std::max(2, c.rows), err, true)) return 1;
-    batch.set_pcie_mode(2); // Match the stock Windows-safe kernel-copy path.
+    auto stages = stage_config;
+    if (stages.empty()) stages.push_back({m.stages[0]->device, 0, g.n_layers,
+                                          m.slots[0]->state(), &wt, head, &cache, hits});
+    if (stages.size() != m.stages.size()) { err = "concurrency: prepared stage count changed"; return 1; }
+    int64_t next_layer = 0;
+    for (size_t i = 0; i < stages.size(); ++i) {
+        const auto& st = stages[i];
+        if (st.device != m.stages[i]->device || st.begin != next_layer || st.end <= st.begin ||
+            st.end > g.n_layers || !st.weights || !st.cache || !st.hits.d_res || st.cache->slots() < 1) {
+            err = "concurrency: invalid layer stage or expert cache"; return 1;
+        }
+        next_layer = st.end;
+    }
+    if (next_layer != g.n_layers || !stages.back().head || !stages.back().head->loaded()) {
+        err = "concurrency: stages must cover every layer and end with a native head"; return 1;
+    }
+    struct PoolRoute {
+        std::vector<ConcurrentStage>* stages;
+        std::vector<core::GpuPlanSink*> plans;
+        core::ExpertDispatch* dispatch;
+        core::PoolMultiFn base;
+        void* user;
+    } route{&stages, std::vector<core::GpuPlanSink*>(stages.size()), &dispatch, pool, user};
+    pool = [](void* opaque, const float* x, const int32_t* ids, int64_t n, int64_t k, float* out, int64_t layer) {
+        auto& r = *static_cast<PoolRoute*>(opaque);
+        size_t i = 0;
+        while (i + 1 < r.stages->size() && layer >= (*r.stages)[i].end) ++i;
+        const auto& st = (*r.stages)[i];
+        r.dispatch->plan = r.plans[i];
+        r.dispatch->cache_base = st.hits.cache_base;
+        r.dispatch->cache_slot_off = st.hits.slot_off;
+        r.dispatch->pcie_num = 0;
+        r.base(r.user, x, ids, n, k, out, layer);
+    };
+    user = &route;
+    std::vector<std::unique_ptr<core::Verifier>> batches;
+    // Each request has its own portable hand-offs. Reusing another request's
+    // residual storage would cross-contaminate windows and commit state.
+    for (auto& slot : m.slots) for (size_t i = 0; i + 1 < stages.size(); ++i) {
+        auto& part = *slot->parts[i];
+        const core::OnDevice on(part.device);
+        const size_t bytes = (size_t)c.window * core::Verifier::handoff_floats(g) * sizeof(float);
+        if (cudaHostAlloc((void**)&part.handoff, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+            err = "concurrency: portable residual hand-off allocation failed"; return 1;
+        }
+        std::fill_n(part.handoff, bytes / sizeof(float), 0.0f);
+    }
+    // Initialise from the last stage so the earlier prompt paths can link to it.
+    for (size_t reverse = stages.size(); reverse > 0; --reverse) {
+        const size_t i = reverse - 1;
+        const auto& st = stages[i];
+        const auto& storage = *m.stages[i];
+        const core::OnDevice on(st.device);
+        for (auto& slot : m.slots) {
+            auto& part = *slot->parts[i];
+            part.verify->set_stage(st.begin, st.end, i ? slot->parts[i-1]->handoff : nullptr, part.handoff);
+            if (i + 1 < stages.size()) part.verify->set_next(slot->parts[i+1]->verify.get(), &route);
+            part.prompt->set_stage(st.begin, st.end, i + 1 < stages.size() ? slot->parts[i+1]->prompt.get() : nullptr);
+            if (!part.verify->init(*st.weights, g, *part.state, st.hits, st.head, c.window, err) ||
+                !part.prompt->init(*st.weights, g, *part.state, source, st.cache, host_res, c.prefill_chunk,
+                                   storage.prompt_stream, err, storage.prompt_workspace, storage.prompt_bytes)) return 1;
+            part.verify->set_pcie_mode(2);
+        }
+    }
+    for (size_t i = 0; i < stages.size(); ++i) {
+        const auto& st = stages[i];
+        const core::OnDevice on(st.device);
+        batches.push_back(std::make_unique<core::Verifier>());
+        auto& batch = *batches.back();
+        const auto& part = *m.slots[0]->parts[i];
+        batch.set_stage(st.begin, st.end, i ? m.slots[0]->parts[i-1]->handoff : nullptr, part.handoff);
+        batch.set_batch_cache(c.graph_cache, c.reserve_mib);
+        batch.set_batch_parallel(c.parallel_batch);
+        if (!batch.init(*st.weights, g, *part.state, st.hits, st.head, std::max(2, c.rows), err, true)) return 1;
+        batch.set_pcie_mode(2);
+    }
     for (auto& ptr : m.slots) {
-        auto& s = *ptr;
-        if (!s.verify.init(wt, g, *s.state, hits, head, c.window, err) ||
-            !s.draft->bind(wt, head, s.verify.final_R_all(), err) ||
-            !s.prompt.init(wt, g, *s.state, source, &cache, host_res, c.prefill_chunk, m.prompt_stream,
-                           err, m.prompt_workspace, m.prompt_bytes)) return 1;
-        s.history.resize((size_t) c.window * 4096, -1);
-        if (cudaMalloc(&s.history_device, s.history.size() * sizeof(int32_t)) != cudaSuccess) { err = "concurrency: penalty buffer allocation failed"; return 1; }
-        auto* slot = &s;
-        s.verify.set_pcie_mode(2);
-        s.prompt.on_chunk = [slot](const float* residual, int64_t n, int64_t position, std::string& e) {
-            std::vector<int32_t> next((size_t) n);
-            for (int64_t j = 0; j < n; ++j) next[(size_t) j] = (int32_t) slot->request.tokens[(size_t) (position + j + 1)];
-            // Use the existing draft implementation; both slots share only immutable weights.
-            return slot->draft->prefill(residual, next.data(), n, position, e);
+        auto& slot = *ptr;
+        const auto& last = stages.back();
+        const core::OnDevice on(last.device);
+        if (!slot.draft->bind(*last.weights, last.head, slot.verify().final_R_all(), err)) return 1;
+        slot.history.resize((size_t)c.window * 4096, -1);
+        if (cudaMalloc(&slot.history_device, slot.history.size() * sizeof(int32_t)) != cudaSuccess) {
+            err = "concurrency: penalty buffer allocation failed"; return 1;
+        }
+        auto* request = &slot;
+        slot.parts.back()->prompt->on_chunk = [request](const float* residual, int64_t n, int64_t position, std::string& e) {
+            std::vector<int32_t> next((size_t)n);
+            for (int64_t j = 0; j < n; ++j) next[(size_t)j] = (int32_t)request->request.tokens[(size_t)(position+j+1)];
+            return request->draft->prefill(residual, next.data(), n, position, e);
         };
     }
-    size_t free = 0, total = 0;
-    cudaMemGetInfo(&free, &total);
-    if (free < (size_t) c.reserve_mib * 1048576) {
-        err = "concurrency: remaining VRAM is below the requested reserve; lower expert cache/context"; return 1;
+    for (const auto& st : stages) {
+        const core::OnDevice on(st.device);
+        size_t free = 0, total = 0;
+        if (cudaMemGetInfo(&free, &total) != cudaSuccess || free < (size_t)c.reserve_mib * 1048576) {
+            err = "concurrency: remaining VRAM below reserve on CUDA" + std::to_string(st.device); return 1;
+        }
+        std::fprintf(stderr, "strata concurrent: CUDA%d layers %lld-%lld, %d independent request states, %lld expert slots\n",
+                     st.device, (long long)st.begin, (long long)(st.end-1), c.requests, (long long)st.cache->slots());
     }
     const bool adaptive = c.adapt_every > 0 && c.adapt_swaps > 0;
     if (adaptive) dispatch.usage.assign((size_t) g.n_layers * g.n_expert, 0.0f);
@@ -309,9 +443,19 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
     int64_t produced = 0, target_rows = 0;
     auto report_profile = [&]() {
         if (!profiling || !rounds) return;
-        double wait = batch.ms_wait, pool_ms = batch.ms_pool, host = batch.ms_host;
-        for (const auto& s : m.slots) {
-            wait += s->verify.ms_wait; pool_ms += s->verify.ms_pool; host += s->verify.ms_host;
+        double wait = 0, pool_ms = 0, host = 0, capture_ms = 0;
+        int64_t captures = 0;
+        double gpu_ms[4]{}, expert_ms[6]{}, member_ms[2][19]{};
+        for (const auto& b : batches) {
+            wait += b->ms_wait; pool_ms += b->ms_pool; host += b->ms_host;
+            captures += b->batch_captures; capture_ms += b->ms_batch_capture;
+            for (int i = 0; i < 4; ++i) gpu_ms[i] += b->batch_gpu_ms[i];
+            for (int i = 0; i < 6; ++i) expert_ms[i] += b->batch_expert_ms[i];
+            for (int kind = 0; kind < 2; ++kind) for (int i = 1; i <= 18; ++i)
+                member_ms[kind][i] += b->batch_member_pre_ms[kind][i];
+        }
+        for (const auto& slot : m.slots) for (const auto& part : slot->parts) {
+            wait += part->verify->ms_wait; pool_ms += part->verify->ms_pool; host += part->verify->ms_host;
         }
         std::fprintf(stderr, "strata concurrent profile: rounds=%lld tokens=%lld rows=%lld target_ms=%.1f "
                      "draft_ms=%.1f commit_ms=%.1f adapt_ms=%.1f prefill_ms=%.1f "
@@ -321,12 +465,11 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
         std::fflush(stderr);
         std::fprintf(stderr, "strata concurrent detail: captures=%lld capture_ms=%.1f gpu_pre_ms=%.1f "
                      "gpu_experts_ms=%.1f gpu_post_ms=%.1f gpu_head_ms=%.1f\n",
-                     (long long) batch.batch_captures, batch.ms_batch_capture, batch.batch_gpu_ms[0],
-                     batch.batch_gpu_ms[1], batch.batch_gpu_ms[2], batch.batch_gpu_ms[3]);
+                     (long long) captures, capture_ms, gpu_ms[0], gpu_ms[1], gpu_ms[2], gpu_ms[3]);
         if (std::getenv("STRATA_VERIFY_PROFILE"))
             std::fprintf(stderr, "strata concurrent experts: plan_wait_ms=%.1f resident_ms=%.1f fetch_ms=%.1f pcie_ms=%.1f cpu_wait_ms=%.1f combine_ms=%.1f\n",
-                         batch.batch_expert_ms[0], batch.batch_expert_ms[1], batch.batch_expert_ms[2],
-                         batch.batch_expert_ms[3], batch.batch_expert_ms[4], batch.batch_expert_ms[5]);
+                         expert_ms[0], expert_ms[1], expert_ms[2],
+                         expert_ms[3], expert_ms[4], expert_ms[5]);
         if (std::getenv("STRATA_EXPERT_PROFILE")) {
             std::fprintf(stderr, "strata concurrent routing: layers=%lld all_hit=%lld distinct=%lld misses=%lld resident_groups=",
                          (long long) dispatch.profile_layers, (long long) dispatch.profile_all_hit,
@@ -338,8 +481,8 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
             for (int kind = 0; kind < 2; ++kind) {
                 std::fprintf(stderr, "strata concurrent first-member pre: kind=%s", kind ? "QSA" : "GDN");
                 for (int i = 1; i <= 18; ++i)
-                    if (batch.batch_member_pre_ms[kind][i] > 0)
-                        std::fprintf(stderr, " stage%d_ms=%.1f", i, batch.batch_member_pre_ms[kind][i]);
+                    if (member_ms[kind][i] > 0)
+                        std::fprintf(stderr, " stage%d_ms=%.1f", i, member_ms[kind][i]);
                 std::fprintf(stderr, "\n");
             }
         }
@@ -371,17 +514,27 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
             const size_t incoming = (size_t) s.layer * g.n_expert + s.in, outgoing = (size_t) s.layer * g.n_expert + s.out;
             const int slot = host_res[outgoing];
             const auto* blob = source->blob(s.layer, s.in);
-            if (!blob || !cache.fill_slot_blocking(slot, blob, err, (int64_t) kernels::cpu::expert_layout().blob_bytes(s.layer))) return false;
+            size_t stage = 0;
+            while (stage + 1 < stages.size() && s.layer >= stages[stage].end) ++stage;
+            const core::OnDevice on(stages[stage].device);
+            if (!blob || !stages[stage].cache->fill_slot_blocking(slot, blob, err,
+                    (int64_t)kernels::cpu::expert_layout().blob_bytes(s.layer))) return false;
             host_res[outgoing] = core::kNotResident; host_res[incoming] = slot;
         }
-        if (!swaps.empty() && cudaMemcpy((void*) hits.d_res, host_res, (size_t) g.n_layers * g.n_expert * sizeof(int32_t),
-                                        cudaMemcpyHostToDevice) != cudaSuccess) { err = "concurrency: residency upload failed"; return false; }
+        if (!swaps.empty()) for (const auto& st : stages) {
+            const core::OnDevice on(st.device);
+            if (cudaMemcpy((void*)st.hits.d_res, host_res, (size_t)g.n_layers * g.n_expert * sizeof(int32_t),
+                           cudaMemcpyHostToDevice) != cudaSuccess) {
+                err = "concurrency: residency upload failed"; return false;
+            }
+        }
         for (float& usage : dispatch.usage) usage *= 0.7f;
         return true;
     };
     std::fprintf(stderr, "strata concurrent: shared expert batching; independent MTP; adaptive cache %s; no conversation-prefix reuse\n", adaptive ? "on" : "off");
-    std::printf("INFO engine=" STRATA_VERSION " concurrency=%d batch_rows=%d batch_policy=%s context=%lld kv=int8 lookup=%d expert_policy=%s\n",
-                c.requests, c.rows, c.depth ? "depth" : "fair", (long long) c.context, c.suffix, adaptive ? "adaptive" : "static");
+    std::printf("INFO engine=" STRATA_VERSION " concurrency=%d batch_rows=%d batch_policy=%s context=%lld kv=int8 lookup=%d expert_policy=%s gpus=%zu\n",
+                c.requests, c.rows, c.depth ? "depth" : "fair", (long long)c.context, c.suffix,
+                adaptive ? "adaptive" : "static", stages.size());
     std::printf("READY %lld stop multiplex\n", (long long) c.context);
     std::fflush(stdout);
     auto input = std::make_shared<Input>();
@@ -475,13 +628,14 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
             for (int t = s.count; t < c.window; ++t) s.window[t] = s.current;
             const int history = s.request.sampling.penalty_last_n;
             if (history > 0) {
+                const core::OnDevice on(stages.back().device);
                 kernels::penalty_rows(s.consumed.data(), (int64_t) s.consumed.size(), s.window, s.count, history, s.history.data());
                 if (cudaMemcpy(s.history_device, s.history.data(), (size_t) s.count * history * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
                     err = "concurrency: history upload failed"; return false;
                 }
             }
-            s.verify.set_history(history ? s.history_device : nullptr, history);
-            windows.push_back({&s.verify, s.count, s.window, s.position, s.output});
+            s.verify().set_history(history ? s.history_device : nullptr, history);
+            windows.push_back({&s.verify(), s.count, s.window, s.position, s.output});
         }
         if (!windows.empty()) {
             ++batch_sizes[windows.size()];
@@ -499,7 +653,7 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
             // Fairness still rotates admission; packing must not rotate with it.
             auto slot_index = [&](const core::Verifier* verifier) {
                 for (size_t i = 0; i < m.slots.size(); ++i)
-                    if (&m.slots[i]->verify == verifier) return i;
+                    if (&m.slots[i]->verify() == verifier) return i;
                 return m.slots.size();
             };
             std::sort(windows.begin(), windows.end(), [&](const auto& a, const auto& b) {
@@ -508,7 +662,7 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
             const auto start = Clock::now();
             if (trace_rounds) {
                 std::fprintf(stderr, "round-order %lld", (long long) rounds);
-                for (const auto& w : windows) for (auto* s : ready) if (&s->verify == w.verifier)
+                for (const auto& w : windows) for (auto* s : ready) if (&s->verify() == w.verifier)
                     std::fprintf(stderr, " %llu:%d", (unsigned long long) s->request.id, w.count);
                 std::fprintf(stderr, "\n");
             }
@@ -522,11 +676,22 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
             bool ok;
             if (windows.size() == 1) {
                 const auto& w = windows.front();
-                dispatch.plan = w.verifier->plan_sink();
+                for (size_t i = 0; i < stages.size(); ++i) {
+                    for (const auto& slot : m.slots) if (&slot->verify() == w.verifier)
+                        route.plans[i] = slot->parts[i]->verify->plan_sink();
+                }
                 ok = w.verifier->run(w.count, w.tokens, w.position, pool, user, w.output, err);
             } else {
-                dispatch.plan = batch.plan_sink();
-                ok = batch.run_batch(windows, pool, user, err);
+                ok = true;
+                for (size_t stage = 0; stage < stages.size() && ok; ++stage) {
+                    route.plans[stage] = batches[stage]->plan_sink();
+                    auto members = windows;
+                    for (auto& member : members) for (const auto& slot : m.slots)
+                        if (&slot->verify() == member.verifier) {
+                            member.verifier = slot->parts[stage]->verify.get(); break;
+                        }
+                    ok = batches[stage]->run_batch(members, pool, user, err);
+                }
             }
             if (!ok || dispatch.failed) {
                 if (dispatch.failed) err = dispatch.fail ? dispatch.fail : "expert dispatch failed";
@@ -550,7 +715,7 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
                     if ((size_t)s.generated >= forced_it->second.size()) { err = "diagnostic: continuation exhausted"; return false; }
                     if (s.generated % 16 == 0) {
                         std::vector<float> logits;
-                        if (!s.verify.diagnostic_logits(logits, err)) return false;
+                        if (!s.verify().diagnostic_logits(logits, err)) return false;
                         const uint64_t header[] = {s.request.id, (uint64_t)s.generated, (uint64_t)s.position, (uint64_t)logits.size()};
                         numerical_trace.write((const char*)header, sizeof(header));
                         numerical_trace.write((const char*)logits.data(), logits.size() * sizeof(float));
@@ -564,7 +729,7 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
                     keep = t + 1; eos = true; break;
                 }
                 const auto commit_start = Clock::now();
-                if (!s.verify.commit(keep, err)) return false;
+                if (!s.verify().commit(keep, err)) return false;
                 commit_ms += elapsed(commit_start);
                 produced += keep;
                 s.offered += s.count - 1; s.accepted += keep - 1;
@@ -654,10 +819,15 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
             std::fill(std::begin(s.probability), std::end(s.probability), 0.0f);
             s.suffix.reset(); s.policy = spec::DraftPolicy{c.window, 0.03, policy_costs};
             for (auto token : s.request.tokens) s.suffix.append((int32_t) token);
-            core::session_zero(*s.state, g, nullptr, m.prompt_stream);
-            if (cudaStreamSynchronize(m.prompt_stream) != cudaSuccess) { err = "concurrency: reset failed"; return 1; }
+            for (size_t i = 0; i < stages.size(); ++i) {
+                const core::OnDevice on(stages[i].device);
+                core::session_zero(*s.parts[i]->state, g, nullptr, m.stages[i]->prompt_stream);
+                if (cudaStreamSynchronize(m.stages[i]->prompt_stream) != cudaSuccess) {
+                    err = "concurrency: reset failed"; return 1;
+                }
+            }
             s.draft->reset(); s.draft->set_prompt_len((int64_t) s.request.tokens.size());
-            s.verify.set_sampling(s.request.sampling);
+            s.verify().set_sampling(s.request.sampling);
         }
         // At most ONE bounded prompt chunk before returning to ready decoders.
         core::progress().busy.store(!live.empty());
@@ -668,7 +838,7 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
             const auto start = Clock::now();
             const auto n = std::min<int64_t>(c.prefill_chunk, s.position - s.read);
             if (!prefill_yield) {
-                if (!s.prompt.run(s.request.tokens.data() + s.read, n, s.read, err)) return 1;
+                if (!s.prompt().run(s.request.tokens.data() + s.read, n, s.read, err)) return 1;
             } else {
                 // Freeze eligibility before suspending: no new request can enter the callback.
                 std::vector<Impl::Slot*> eligible;
@@ -677,16 +847,18 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
                         eligible.push_back(ptr.get());
                 PrefillYieldBudget budget(yield_interval_ms);
                 struct ClearYield {
-                    prefill::Prefill& prompt;
-                    ~ClearYield() { prompt.yield_requested = {}; prompt.on_yield = {}; }
-                } clear_yield{s.prompt};
+                    Impl::Slot& slot;
+                    ~ClearYield() { for (auto& part : slot.parts) {
+                        part->prompt->yield_requested = {}; part->prompt->on_yield = {};
+                    } }
+                } clear_yield{s};
                 if (!eligible.empty()) {
-                    s.prompt.yield_requested = [&]() {
+                    s.prompt().yield_requested = [&]() {
                         const bool ready = std::any_of(eligible.begin(), eligible.end(),
                             [](const auto* slot) { return slot->active && slot->read >= slot->position; });
                         return budget.due(elapsed(start), ready);
                     };
-                    s.prompt.on_yield = [&](std::string& callback_err) {
+                    s.prompt().on_yield = [&](std::string& callback_err) {
                         const auto yield_start = Clock::now();
                         // The callback error aliases run's err. A failed round aborts this prompt and server.
                         if (!decode_ready(&eligible, &budget)) {
@@ -700,7 +872,11 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
                         return true;
                     };
                 }
-                if (!s.prompt.run(s.request.tokens.data() + s.read, n, s.read, err)) return 1;
+                for (size_t i = 1; i < s.parts.size(); ++i) {
+                    s.parts[i]->prompt->yield_requested = s.prompt().yield_requested;
+                    s.parts[i]->prompt->on_yield = s.prompt().on_yield;
+                }
+                if (!s.prompt().run(s.request.tokens.data() + s.read, n, s.read, err)) return 1;
                 // The target chunk, its copy stream, and the on_chunk MTP prefill have all completed.
                 // Coalesce deadlines; never replay stale swap plans or mutate residency under Prefill.
                 if (budget.take_adaptation()) {
