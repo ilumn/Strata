@@ -1299,8 +1299,9 @@ bool Verifier::run_batch(const std::vector<BatchWindow>& batch, PoolMultiFn pool
             for (int stage = 0; stage < 6; ++stage)
                 batch_expert_ms[stage] += (double) (prof_h_[(size_t) l * kProfPer + expert_end[stage]] -
                                                     prof_h_[(size_t) l * kProfPer + expert_begin[stage]]) / 1e6;
-        batch_gpu_ms[3] += (double) (prof_h_[(size_t) g_->n_layers * kProfPer + 3] -
-                                     prof_h_[(size_t) g_->n_layers * kProfPer + 2]) / 1e6;
+        if (le_ == g_->n_layers)
+            batch_gpu_ms[3] += (double) (prof_h_[(size_t) g_->n_layers * kProfPer + 3] -
+                                         prof_h_[(size_t) g_->n_layers * kProfPer + 2]) / 1e6;
         // Inspect one member's already-recorded stamps. Summing all members would
         // double-count overlapping streams and misrepresent the critical path.
         auto& member = *batch.front().verifier;
