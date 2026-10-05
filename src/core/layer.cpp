@@ -574,6 +574,18 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
     return align_up16(n) + 256;
 }
 
+void qsa_state_release_host(QsaState& st) {
+    if (st.host_step) cudaFreeHost(st.host_step);
+    if (st.host_pos) cudaFreeHost(st.host_pos);
+    if (st.kv_host_arena) cudaFreeHost(st.kv_host_arena);
+    if (st.kv_host_bytes <= g_kv_host_bytes) g_kv_host_bytes -= st.kv_host_bytes;
+    st.host_step = nullptr;
+    st.host_pos = nullptr;
+    st.kv_host_arena = nullptr;
+    st.kv_host_bytes = 0;
+    st.host = strata::kernels::KvHostPools{};
+}
+
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
                         const QsaState* share_rope, int64_t ring_cells) {
     const QsaShapes s = qsa_shapes(g);
@@ -659,8 +671,9 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
         uint8_t* h = nullptr;
         uint8_t* d = nullptr;
-        if (cudaHostAlloc((void**) &h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-            cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
+        const cudaError_t host_alloc = cudaHostAlloc((void**) &h, bytes, cudaHostAllocMapped | cudaHostAllocPortable);
+        st.kv_host_arena = h;   // retain even a half-built allocation for the owner's failure cleanup
+        if (host_alloc != cudaSuccess || cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
             // under WSL the NVIDIA driver pins only ~1 GiB in all, which is less than 128K of 8-bit KV needs
             if (p.mode == 1) std::fprintf(stderr, "strata: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
                                  "(%.2f GiB pinned so far) - lower the context, or run without --kv-resident (under "
@@ -669,6 +682,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             return 0;
         }
         g_kv_host_bytes += bytes;
+        st.kv_host_bytes = bytes;
         Cursor hc{d};
         if (st.kv_q4) {
             st.host.k_q4 = hc.take<uint8_t>(hrows * q4_row);

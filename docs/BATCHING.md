@@ -83,6 +83,18 @@ about 10-25% speed per request on this card". `--parallel N` is honoured as aske
 - Slots are assigned so that consecutive requests land in different pipeline groups (`--batch-groups`).
 - A client that disconnects stops its slot (`BSTOP`); the others go on.
 
+## Fully resident split stages
+
+A stage whose routed experts are all in its VRAM cache records a graph with no per-layer CPU doorbells. Both
+blocking batch windows and pipeline polling wait for that graph's completion directly. If the stage owns PLE,
+its already-gathered rows are released through the single upload fence. Partially resident stages retain the
+CPU handshake. A split can contain both kinds of stage.
+
+Batch slot arenas are owned by their allocating devices. If a later stage fits fewer slots, discarding excess
+slots returns the earlier stage's memory before its expert cache is sized. Verifier, drafter and prefill
+resource release select their owning device and restore the caller's device afterward.
+
+
 ## Exactness
 
 A batch row's arithmetic is the single-token window's, so with greedy decoding **every conversation of a batch

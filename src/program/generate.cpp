@@ -28,6 +28,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
+#include "strata/core/session_owner.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -2930,7 +2931,8 @@ int main(int argc, char** argv) {
     // slot of the batch windows.  Before the expert cache is sized, so `--expert-cache auto` leaves them room.
     // Recommend, never force: a count the engine cannot run is said and adjusted (or batching left off) - the
     // engine still starts and serves one request at a time.
-    std::vector<std::vector<std::unique_ptr<strata::core::SessionState>>> bslot_ss;
+    using BatchSession = std::unique_ptr<strata::core::SessionState, strata::core::DeviceSessionDeleter>;
+    std::vector<std::vector<BatchSession>> bslot_ss;
     if (o.batch != 0) {
         const int cap = strata::kernels::kVerifyMaxT;
         const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
@@ -2965,7 +2967,7 @@ int main(int argc, char** argv) {
                 void* buf = nullptr;
                 if (cudaMalloc(&buf, bytes) != cudaSuccess || strata::core::session_init(g, o.max_context, K, buf, *u, lo, hi) == 0) {
                     cudaGetLastError();
-                    if (buf != nullptr) cudaFree(buf);
+                    strata::core::DeviceSessionDeleter{dev, buf}(u.release());
                     size_t fb = 0, tb = 0;
                     cudaMemGetInfo(&fb, &tb);
                     std::fprintf(stderr, "strata generate: WARNING: --batch %d: slot %d's session does not fit on CUDA%d "
@@ -2975,7 +2977,7 @@ int main(int argc, char** argv) {
                     break;
                 }
                 strata::core::session_zero(*u, g, nullptr, nullptr);
-                bslot_ss[k].push_back(std::move(u));
+                bslot_ss[k].emplace_back(u.release(), strata::core::DeviceSessionDeleter{dev, buf});
             }
             cudaDeviceSynchronize();
             size_t fb = 0, tb = 0;
@@ -2984,6 +2986,15 @@ int main(int argc, char** argv) {
                          (int) bslot_ss[k].size(), dev, (double) bytes / 1073741824.0, (double) fb / 1073741824.0);
         }
         for (auto& v : bslot_ss) if ((int) v.size() > fit) v.resize((size_t) fit);   // the same count on every stage
+        // Trimming may free the last slot that registered a rope-angle table. The foreground
+        // session owns an equivalent table that remains live regardless of the fitted slot count.
+        if (g.n_qsa_layers() > 0) for (size_t k = 0; k < bslot_ss.size(); ++k) {
+            const strata::core::OnDevice on(k == 0 ? 0 : stages[k - 1]->dev);
+            const auto& foreground = k == 0 ? ss : stages[k - 1]->ss;
+            const auto& qsa = foreground.qsa_states[foreground.qsa_primary()];
+            strata::kernels::rope_table_set(qsa.cos_tab, qsa.sin_tab, (int) qsa.max_cells,
+                                           strata::kernels::rope_scaling());
+        }
         if (fit < 2) {
             std::fprintf(stderr, "strata generate: WARNING: --batch is off: not two slot sessions fit (a smaller "
                                  "--max-context or KV streaming, --kv-resident, makes them smaller)\n");

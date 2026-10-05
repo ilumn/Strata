@@ -602,16 +602,25 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
 }  // namespace
 
 Prefill::Prefill() : impl_(new Impl) {}
-Prefill::~Prefill() { release(); }
+Prefill::~Prefill() {
+    const core::OnDevice on_device(impl_ ? impl_->device : -1);
+    release();
+    impl_.reset();   // cuBLAS/MMQ member owners must also be destroyed on this device
+}
 
 void Prefill::reset() {
-    release();
+    {
+        const core::OnDevice on_device(impl_ ? impl_->device : -1);
+        release();
+        impl_.reset();
+    }
     impl_.reset(new Impl);
     stats_ = PrefillStats{};
 }
 
 void Prefill::release() {
     if (!impl_) return;
+    const core::OnDevice on_device(impl_->device);
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
     for (int i = 0; i < RING_MAX; ++i) {

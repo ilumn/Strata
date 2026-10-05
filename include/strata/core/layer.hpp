@@ -263,6 +263,8 @@ struct QsaState {
     ///
     /// Pinned as well as fixed, because a pageable source would make `cudaMemcpyAsync` a synchronous staged
     /// copy and give back the overlap the doorbell protocol exists for.
+    void* kv_host_arena = nullptr; ///< owning host address of the optional mapped KV backing
+    uint64_t kv_host_bytes = 0;    ///< accounted pinned bytes; zero until backing allocation succeeds
     int32_t* host_step = nullptr;    ///< (kStepCount + 1,) pinned; final element is attention status
     int32_t* host_pos = nullptr;     ///< (n_head,) pinned
 };
@@ -304,6 +306,9 @@ inline int qsa_kv_format(const QsaState& st) {
     }
     return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
 }
+/// Release independently allocated pinned staging/backing of a carved state (not its borrowed device arena).
+void qsa_state_release_host(QsaState& state);
+
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
                         const QsaState* share_rope = nullptr, int64_t ring_cells = 0);
 /// KV streaming: the pools a reader sees (the VRAM slots) and, when streamed, make the selection's blocks resident.

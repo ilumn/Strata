@@ -268,6 +268,7 @@ void Verifier::diag(std::FILE* f) const {
 }
 
 Verifier::~Verifier() {
+    const OnDevice on_device(device_);
     const Verifier* self = this;
     g_diag_verifier.compare_exchange_strong(self, nullptr);
     for (auto& slot : g_live) {
@@ -1966,7 +1967,10 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     (void) cudaStreamQuery(cs_);
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
-    const int64_t steps = le_ - lb_;
+    // Fully resident graphs do not ring a per-layer CPU doorbell. PLE rows are already gathered
+    // in stage_batch; release that graph's one upload fence, then wait for the graph itself.
+    if (all_resident_ && ss_->ple.ready() && ple_stage()) raise_flag(h_flag_, 1);
+    const int64_t steps = all_resident_ ? 0 : le_ - lb_;
     for (int64_t k = 0; k < steps; ++k) {
         const int64_t l = lb_ + k;
         const uint32_t want = (uint32_t) (k + 1);
@@ -2080,7 +2084,8 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
         }
     b_running_ = true;
     b_k_ = 0;
-    b_steps_ = le_ - lb_;
+    if (all_resident_ && ss_->ple.ready() && ple_stage()) raise_flag(h_flag_, 1);
+    b_steps_ = all_resident_ ? 0 : le_ - lb_;
     b_last_ = Clock::now();
     return true;
 }
@@ -2150,7 +2155,8 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
 
 bool Verifier::copy_logits(int t, float* host) const {
     if (next_ != nullptr) return next_->copy_logits(t, host);   // a layer split: the head is on the last stage
-    if (head_logits_ == nullptr || host == nullptr || t < 0 || n_vocab_ <= 0) return false;
+    const OnDevice on_device(device_);
+    if (head_logits_ == nullptr || host == nullptr || t < 0 || t >= last_t_ || n_vocab_ <= 0) return false;
     return cudaMemcpy(host, head_logits_ + (size_t) t * (size_t) n_vocab_, (size_t) n_vocab_ * sizeof(float),
                       cudaMemcpyDeviceToHost) == cudaSuccess;
 }
